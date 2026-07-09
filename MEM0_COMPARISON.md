@@ -1,6 +1,4 @@
-# Comparative Analysis: Ledger (Custom) vs. Mem0
-
-This document provides a highly technical, feature-by-feature architectural comparison between Ledger's custom implementation and the open-source **Mem0** framework, fulfilling the directive to evaluate these custom concepts against external industry standards.
+# Comparative Analysis: Ledger vs. Mem0
 
 ---
 
