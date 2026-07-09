@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.pytest_cache/
+node_modules/
+dist/
+.claude/
+.agents/
+.DS_Store
+
+# Local demo/sales walkthrough, kept off the public repo
+DEMO_WALKTHROUGH.md

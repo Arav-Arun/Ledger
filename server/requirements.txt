@@ -1,0 +1,5 @@
+openai>=1.60
+psycopg[binary,pool]>=3.2
+pydantic>=2.7
+fastapi>=0.115
+uvicorn[standard]>=0.30
