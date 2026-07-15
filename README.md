@@ -40,18 +40,19 @@ Executes before every reply to retrieve relevant context.
 
 ```mermaid
 flowchart LR
-    M(["Message"]) --> E["Embed"] --> V["Vector Search"] --> RK["Contextual Rerank"] --> TOP["Top Facts"] --> AG[["Agent"]]
+    M(["Message"]) --> E["Embed"] --> V["Vector Search"] --> RK["Blended Rerank"] --> TOP["Top Facts"] --> AG[["Agent"]]
 ```
 
-1. **Vector Retrieval**: Fetches candidate facts using cosine similarity search.
-2. **Contextual Reranking**: Evaluates candidates against the recent chat history via an LLM to elevate facts critical to the immediate context and filter out irrelevant data.
+1. **Vector Retrieval**: Fetches a candidate pool using cosine similarity search, on a query contextualised with the customer's recent turns.
+2. **Contextual Reranking**: Reorders the pool with a **deterministic blended score** — cosine relevance + a category importance prior (open commitments and live issues outrank stable profile facts) + recency decay + light keyword overlap — and drops anything below a relevance floor. No LLM in the hot path; every weight and threshold is an explicit, env-overridable constant.
 
 ---
 
 ## Core Features
 
 - **Cross-session Recall**: Retains user preferences and active issues across distinct sessions.
-- **Contextual Reranking**: Surfaces facts relevant to the exact conversation context rather than relying exclusively on static semantic similarity.
+- **Contextual Reranking**: Blends semantic relevance with category importance, recency, and keyword overlap — so open commitments and live issues surface ahead of equally-similar background facts — rather than relying exclusively on static semantic similarity. Deterministic and reproducible; no LLM in the retrieval path.
+- **Grounded Replies (demo harness)**: The sample assistant drafts a reply, a grader scores it against an explicit grounding rubric, and it revises until the rubric passes or a hard iteration cap is hit. The check **fails closed** — a reply is only marked "grounded" if every criterion explicitly passed — and an ungrounded reply is never learned into long-term memory. The per-turn verdict trail is shown in the UI.
 - **Append-only Audit Trail**: Maintains a complete history of all memory operations (ADD, UPDATE, DELETE) and the originating message source.
 - **Time-bound Facts (TTL)**: Supports expiration dates for automated fact lapsing.
 - **PII Scrubbing**: Applies deterministic pattern matching and Luhn checks to prevent sensitive data ingestion.

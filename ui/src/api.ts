@@ -21,13 +21,25 @@ export type HistoryEntry = {
   created_at: string;
 };
 
-export type Recalled = { id: string; text: string; category: string };
+export type Recalled = { id: string; text: string; category: string; score?: number };
+
+// One rubric criterion's verdict, and one attempt in the draft->grade->revise loop.
+// `verified` is whether the grader actually evaluated this criterion (vs. failing closed).
+export type GroundingCheck = { name: string; passed: boolean; reason: string; verified?: boolean };
+export type GroundingAttempt = {
+  attempt: number;
+  reply: string;
+  passed: boolean;
+  checks: GroundingCheck[];
+};
 
 export type ChatResponse = {
   reply: string;
   memories_used: Recalled[];
   events: MemEvent[];
   redactions: string[];
+  grounding: GroundingAttempt[];
+  grounded: boolean;
 };
 
 export type Session = {

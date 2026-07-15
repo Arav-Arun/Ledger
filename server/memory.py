@@ -2,11 +2,13 @@
 
 Write path:  add()    conversation turn -> extract facts -> scrub PII ->
                       compare with similar memories -> ADD/UPDATE/DELETE/NOOP -> journal
-Read path:   search() query -> vector search (scoped to customer) ->
-                      rerank by relevance + importance + recency
+Read path:   search() query -> vector search (scoped to customer) -> deterministic
+                      blended rerank (relevance + importance + recency + lexical) with a
+                      relevance floor. No LLM in the hot path.
 """
 
 import json
+import logging
 import os
 from datetime import date, datetime, timezone
 
@@ -14,8 +16,10 @@ from openai import OpenAI
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 import store
-from prompts import DECIDE_SYSTEM, EXTRACT_SYSTEM, RERANK_SYSTEM
+from prompts import DECIDE_SYSTEM, EXTRACT_SYSTEM
 from scrub import scrub
+
+log = logging.getLogger("ledger.memory")
 
 # ---------- model I/O (the only code that talks to OpenAI) ----------
 
@@ -216,53 +220,117 @@ def reconcile(customer_id: str, candidates: list[Candidate], source: str) -> lis
     return events
 
 
-# ---------- read path: scoped search + rerank ----------
+# ---------- read path: scoped search + deterministic blended rerank ----------
+#
+# Deterministic-first, mirroring the write path's gate(): the read path ranks with plain,
+# auditable Python arithmetic - no LLM in the hot path. Vector search fetches a candidate
+# pool; the rerank then BLENDS four signals so recall isn't "whatever is nearest in cosine
+# space". Every weight and threshold is an explicit, env-overridable constant (house style,
+# like SIM_ADD_BELOW), so the ranking can be tuned and reasoned about without touching code.
+#
+#   relevance  - cosine similarity to the (conversation-contextualised) query
+#   importance - a per-category prior: an open commitment or a live issue matters more to
+#                the current turn than a stable profile fact or a one-off episode
+#   recency    - exponential decay on the memory's age, so fresh facts edge out stale ones
+#   lexical    - token overlap with the query/recent turns; a cheap hybrid signal so an
+#                order number or ID typed verbatim isn't lost to fuzzy dense similarity
+#
+# A relevance FLOOR drops memories that aren't actually about this query (a real filter,
+# not just a reorder). If a query is so generic that nothing clears the floor, we fall back
+# to ranking the whole pool rather than starving the reply of context.
 
-RERANK_FETCH = 15
+RERANK_FETCH = int(os.getenv("LEDGER_RERANK_FETCH", "15"))
+
+# A candidate must clear this cosine similarity to count as relevant to the query at all.
+RELEVANCE_FLOOR = float(os.getenv("LEDGER_RELEVANCE_FLOOR", "0.20"))
+
+# Blend weights. relevance dominates; the rest nudge the order.
+W_RELEVANCE = float(os.getenv("LEDGER_W_RELEVANCE", "1.0"))
+W_IMPORTANCE = float(os.getenv("LEDGER_W_IMPORTANCE", "0.35"))
+W_RECENCY = float(os.getenv("LEDGER_W_RECENCY", "0.20"))
+W_LEXICAL = float(os.getenv("LEDGER_W_LEXICAL", "0.25"))
+
+# Age (days) at which the recency signal has decayed to half.
+RECENCY_HALFLIFE_DAYS = float(os.getenv("LEDGER_RECENCY_HALFLIFE_DAYS", "45"))
+
+# Importance prior by category. Open obligations to the customer outrank background facts.
+CATEGORY_PRIOR = {
+    "commitment": 1.0,
+    "issue": 0.9,
+    "preference": 0.6,
+    "profile": 0.5,
+    "episode": 0.3,
+}
+DEFAULT_PRIOR = 0.4
 
 
-def contextual_rerank(recent: list[dict], query: str, rows: list[dict], k: int) -> list[dict]:
+def _recency_decay(when, now: datetime) -> float:
+    """0..1 exponential decay on a memory's age; unknown timestamps score neutrally."""
+    if not isinstance(when, datetime):
+        return 0.5
+    try:
+        age_days = max(0.0, (now - when).total_seconds() / 86400.0)
+    except (TypeError, ValueError):
+        return 0.5
+    return 0.5 ** (age_days / RECENCY_HALFLIFE_DAYS)
+
+
+def _lexical_overlap(text: str, terms: set[str]) -> float:
+    """Jaccard token overlap between a memory and the query/recent-turn terms (0..1)."""
+    toks = set(_norm(text).split())
+    if not toks or not terms:
+        return 0.0
+    return len(toks & terms) / len(toks | terms)
+
+
+def _context_terms(recent: list[dict], query: str) -> set[str]:
+    """The keyword bag the lexical signal matches against: this query plus the customer's
+    last few turns, so an ID mentioned a message or two ago still helps."""
+    parts = [query] + [m["content"] for m in (recent or [])[-3:] if m.get("role") == "user"]
+    terms: set[str] = set()
+    for p in parts:
+        terms |= set(_norm(p).split())
+    return terms
+
+
+def _contextual_query(recent: list[dict], query: str) -> str:
+    """Fold the immediately preceding user turn into the text we embed, so retrieval
+    reflects the conversation, not just the latest message in isolation."""
+    prior = [m["content"] for m in (recent or []) if m.get("role") == "user"]
+    return f"{prior[-1]}\n{query}" if prior else query
+
+
+def _blended_score(row: dict, terms: set[str], now: datetime) -> float:
+    similarity = float(row.get("similarity") or 0.0)
+    prior = CATEGORY_PRIOR.get(row.get("category"), DEFAULT_PRIOR)
+    recency = _recency_decay(row.get("updated_at") or row.get("created_at"), now)
+    lexical = _lexical_overlap(row.get("text", ""), terms)
+    return (W_RELEVANCE * similarity + W_IMPORTANCE * prior
+            + W_RECENCY * recency + W_LEXICAL * lexical)
+
+
+def contextual_rerank(recent: list[dict], query: str, rows: list[dict], k: int,
+                      now: datetime | None = None) -> list[dict]:
+    """Rank the retrieved pool by the deterministic blend, drop sub-floor memories, and
+    return the top k. Each returned row carries its `score` so the choice is auditable.
+    Fully deterministic given a fixed clock - no LLM call.
+    """
     if not rows:
         return []
-    if len(rows) <= k:
-        return rows
+    now = now or datetime.now(timezone.utc)
+    terms = _context_terms(recent, query)
+    for r in rows:
+        r["score"] = round(_blended_score(r, terms, now), 4)
 
-    # Format conversation context (last 6 turns)
-    context = "\n".join(f"{m['role']}: {m['content']}" for m in recent[-6:])
-    # Format memories list with indices
-    memories_formatted = "\n".join(f"[{i}] ({r['category']}) {r['text']}" for i, r in enumerate(rows))
-
-    prompt = (
-        f"Conversation history:\n{context or '(session start)'}\n\n"
-        f"Latest user query: {query}\n\n"
-        f"Memories to evaluate and rank:\n{memories_formatted}"
-    )
-
-    try:
-        sys_prompt = RERANK_SYSTEM.format(k=k)
-        raw = _llm_json(sys_prompt, prompt)
-        ranked_indices = raw.get("ranked_indices") or []
-
-        seen = set()
-        reranked = []
-        for idx in ranked_indices:
-            try:
-                i = int(idx)
-                if 0 <= i < len(rows) and i not in seen:
-                    reranked.append(rows[i])
-                    seen.add(i)
-            except (ValueError, TypeError):
-                continue
-
-        # Append remaining candidates in vector order in case LLM missed some
-        for i, row in enumerate(rows):
-            if i not in seen:
-                reranked.append(row)
-
-        return reranked[:k]
-    except Exception:
-        # Fallback to vector search order if LLM reranking fails
-        return rows[:k]
+    kept = [r for r in rows if float(r.get("similarity") or 0.0) >= RELEVANCE_FLOOR]
+    if not kept:
+        # nothing is clearly on-topic (e.g. a broad "what do you know about me?"); rank the
+        # whole pool rather than returning nothing.
+        kept = list(rows)
+    kept.sort(key=lambda r: r["score"], reverse=True)
+    if len(kept) < len(rows):
+        log.info("rerank dropped %d/%d sub-floor memories", len(rows) - len(kept), len(rows))
+    return kept[:k]
 
 
 # ---------- the public API ----------
@@ -280,12 +348,14 @@ class Memory:
 
     def search(self, query: str, customer_id: str, recent: list[dict] | None = None, k: int = 6) -> list[dict]:
         store.expire_sweep(customer_id)
-        # Fetch a pool of candidates based on vector similarity
-        rows = store.similar_memories(customer_id, embed([query])[0], k=RERANK_FETCH)
-        # Rerank candidates dynamically using the LLM contextual reranker
+        # Fetch a candidate pool by vector similarity to the conversation-contextualised
+        # query, then rerank deterministically (relevance + importance + recency + lexical).
+        pool_query = _contextual_query(recent or [], query)
+        rows = store.similar_memories(customer_id, embed([pool_query])[0], k=RERANK_FETCH)
         reranked = contextual_rerank(recent or [], query, rows, k)
         return [
-            {"id": r["id"], "text": r["text"], "category": r["category"]}
+            {"id": r["id"], "text": r["text"], "category": r["category"],
+             "score": r.get("score", 0.0)}
             for r in reranked
         ]
 

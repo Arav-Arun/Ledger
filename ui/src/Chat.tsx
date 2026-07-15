@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type ChatResponse, type Customer, type MemEvent } from "./api";
+import { api, type ChatResponse, type Customer, type GroundingAttempt, type MemEvent } from "./api";
 
 type Turn = {
   role: "user" | "assistant";
   content: string;
   events?: MemEvent[];
   redactions?: string[];
+  grounding?: GroundingAttempt[];
+  grounded?: boolean;
 };
 
 export function Chat(props: {
@@ -51,7 +53,14 @@ export function Chat(props: {
       const r = await api.chat({ customer_id: customer.id, session_id: sessionId, message });
       setTurns((t) => [
         ...t,
-        { role: "assistant", content: r.reply, events: r.events, redactions: r.redactions },
+        {
+          role: "assistant",
+          content: r.reply,
+          events: r.events,
+          redactions: r.redactions,
+          grounding: r.grounding,
+          grounded: r.grounded,
+        },
       ]);
       onTurn(r);
     } catch (e) {
@@ -132,6 +141,11 @@ export function Chat(props: {
                     <span>Memory reconciled</span>
                   </div>
                 )}
+
+                {/* grounding audit trail: draft -> grade -> revise */}
+                {!isUser && !!t.grounding?.length && (
+                  <GroundingPanel grounding={t.grounding} grounded={t.grounded} />
+                )}
               </div>
 
               {isUser && (
@@ -189,6 +203,78 @@ export function Chat(props: {
             </svg>
           </button>
         </div>
+    </div>
+  );
+}
+
+const RUBRIC_LABEL: Record<string, string> = {
+  no_made_up_facts: "No invented details",
+  no_contradiction: "No contradiction",
+  asks_when_unknown: "Asks when unknown",
+};
+
+// The per-turn grounding audit: draft -> grade against the rubric -> revise. Collapsed to
+// a single verdict chip; expands to every attempt and per-criterion pass/fail.
+function GroundingPanel(props: { grounding: GroundingAttempt[]; grounded?: boolean }) {
+  const { grounding, grounded } = props;
+  const [open, setOpen] = useState(false);
+  if (!grounding.length) return null;
+
+  const attempts = grounding.length;
+  const last = grounding[attempts - 1];
+  const passed = last.checks.filter((c) => c.passed).length;
+  const total = last.checks.length;
+
+  return (
+    <div className="px-1.5">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className={`flex items-center gap-1.5 text-[10px] font-semibold transition-colors ${
+          grounded ? "text-emerald-600 hover:text-emerald-700" : "text-amber-600 hover:text-amber-700"
+        }`}
+        title={grounded ? "Reply verified against retrieved evidence" : "Reply could not be fully verified against the evidence"}
+      >
+        <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+          {grounded ? (
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+          ) : (
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M12 3a9 9 0 100 18 9 9 0 000-18z" />
+          )}
+        </svg>
+        <span>
+          {grounded ? "Grounded" : "Unverified"} · {passed}/{total} checks
+          {attempts > 1 ? ` · revised ${attempts - 1}×` : ""}
+        </span>
+        <svg className={`w-2.5 h-2.5 transition-transform ${open ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+        </svg>
+      </button>
+
+      {open && (
+        <div className="mt-1.5 space-y-2 border-l-2 border-slate-100 pl-2.5">
+          {grounding.map((att, i) => (
+            <div key={i} className="space-y-1">
+              {attempts > 1 && (
+                <div className="text-[9px] uppercase tracking-wide text-slate-400 font-semibold">
+                  {i === 0 ? "Draft" : `Revision ${i}`}
+                  {att.passed ? " · passed" : ""}
+                </div>
+              )}
+              {att.checks.map((c) => (
+                <div key={c.name} className="flex items-start gap-1.5 text-[10px] leading-relaxed">
+                  <span className={`shrink-0 font-bold ${c.passed ? "text-emerald-500" : "text-amber-500"}`}>
+                    {c.passed ? "✓" : "✗"}
+                  </span>
+                  <span className="text-slate-500">
+                    <span className="font-medium text-slate-600">{RUBRIC_LABEL[c.name] ?? c.name}</span>
+                    {!c.passed && c.reason ? ` — ${c.reason}` : ""}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

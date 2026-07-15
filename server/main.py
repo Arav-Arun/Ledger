@@ -1,5 +1,6 @@
 """FastAPI app: the JSON API under /api/*, plus the built UI as static files."""
 
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -9,14 +10,19 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-import agent
+import grounding
 import store
 from memory import CATEGORIES, Memory, embed
 from scrub import scrub
 
+log = logging.getLogger("ledger.chat")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Surface the engine's own signals (fail-closed grounding, dropped memories) in the
+    # server log - the read/write paths were previously silent.
+    logging.basicConfig(level=os.getenv("LEDGER_LOG_LEVEL", "INFO"))
     store.init()
     yield
     store.close()
@@ -97,16 +103,29 @@ def chat(body: ChatBody):
     history = store.get_messages(body.session_id)
 
     recalled = memory.search(clean, body.customer_id, recent=history[:-1], k=6)
-    reply = agent.respond(customer["name"], history, Memory.prompt_block(recalled), body.customer_id)
+    memory_block = Memory.prompt_block(recalled)
+
+    # draft -> grade against the rubric -> revise until grounded or the cap is hit.
+    # `grounding_trail` is every attempt and its per-criterion verdict, for the UI/audit;
+    # `grounded` is True only if the reply passed every rubric criterion.
+    reply, grounding_trail, grounded = grounding.answer(
+        customer["name"], history, memory_block, body.customer_id)
     store.add_message(body.session_id, "assistant", reply)
 
-    # sync in the demo so the UI can show this turn's ops; a background task in prod
+    # Only learn from a reply that passed grounding. An ungrounded draft may contain
+    # invented specifics; extracting "facts" from it would launder a hallucination into
+    # permanent memory. We still learn from the customer's own message (pass an empty
+    # assistant turn), just not from an unverified assistant reply.
+    # sync in the demo so the UI can show this turn's ops; a background task in prod.
     # history already contains the user message that was just stored;
     # [:-1] strips it so we only pass prior context, [-6:] caps the window.
-    events = memory.add(clean, reply, body.customer_id, recent=history[:-1][-6:])
+    learn_reply = reply if grounded else ""
+    if not grounded:
+        log.warning("reply for %s was not grounded; not learning from it", body.customer_id)
+    events = memory.add(clean, learn_reply, body.customer_id, recent=history[:-1][-6:])
 
-    return {"reply": reply, "memories_used": recalled,
-            "events": events, "redactions": redactions}
+    return {"reply": reply, "memories_used": recalled, "events": events,
+            "redactions": redactions, "grounding": grounding_trail, "grounded": grounded}
 
 
 @app.get("/api/memories/{customer_id}")

@@ -9,7 +9,7 @@
 | **Database Footprint** | Pure PostgreSQL + `pgvector`. Zero extra infrastructure dependencies. | Abstracted multi-DB wrapper (Qdrant, Pinecone, Chroma) + custom Graph DBs. |
 | **Write Path Orchestration** | Deterministic pre-scrubbing $\rightarrow$ Structured Extraction $\rightarrow$ Heuristic Gating $\rightarrow$ LLM Adjudication. | Abstracted pipelines that feed raw dialogue to LLM parsers. |
 | **State Tracking** | Immutable append-only `memory_events` audit table tracking every state transition. | Key-value state mutations in target vector index; no native audit trail. |
-| **Read Path Retrieval** | Cosine similarity vector query followed by **Contextual LLM Reranking** against live chat history. | Standard $K$-Nearest Neighbor (KNN) vector similarity. |
+| **Read Path Retrieval** | Cosine vector query, then a **deterministic blended rerank** (relevance + category importance + recency + lexical overlap) with a relevance floor - no LLM in the hot path. | Standard $K$-Nearest Neighbor (KNN) vector similarity. |
 | **PII Safety** | Hard deterministic filters (Regex + Luhn checksum validation) prior to LLM boundary. | Downstream prompt guardrails; no built-in deterministic validation. |
 
 ---
@@ -83,7 +83,7 @@ AI memory must never store secrets (credit cards, passwords, OTPs).
 Retrieving memories purely based on vector similarity (used by standard Mem0) fails when the customer's query is ambiguous.
 
 * **Mem0 (Vector Search):** If the customer asks *"Where is my order?"*, a vector search retrieves memories containing the word "order". If the customer has multiple orders, it returns them based purely on mathematical similarity.
-* **Ledger (Contextual Reranking):** Retrieves the top 15 vector matches, then passes them along with the **last 6 turns of chat history** to a fast LLM. The LLM dynamically ranks which memories are relevant *right now*. If the history shows the user is currently complaining about a broken coffee grinder, the coffee grinder memory is elevated, even if it had a lower vector similarity score than a more recent shoe order.
+* **Ledger (Contextual Reranking):** Retrieves the top 15 vector matches for the query (contextualised with the customer's recent turns), then reranks them with a **deterministic blend** - cosine relevance + a category prior (open commitments and live issues outrank stable profile facts) + recency + light keyword overlap - and drops anything below a relevance floor. So for a customer whose open coffee-grinder refund is a `commitment`, that memory is elevated over an equally-similar background preference, and a stale one-off `episode` is demoted - all without an LLM in the retrieval hot path. Reserving the LLM for the write-path gray zone (and grounding) keeps recall fast, cheap, and reproducible.
 
 ---
 

@@ -15,7 +15,8 @@ DEFAULT_CUSTOMERS = [
         "id": "priya_sharma",
         "name": "Priya Sharma",
         "memories": [
-            {"text": "Customer has a pending refund on a returned coffee grinder.", "category": "issue"},
+            {"text": "Customer has a pending refund on a returned coffee grinder (return RET-4821, glass cracked on arrival).", "category": "issue"},
+            {"text": "Customer was promised the coffee-grinder refund would be processed within 5-7 working days.", "category": "commitment"},
             {"text": "Customer prefers short, jargon-free replies.", "category": "preference"},
             {"text": "Customer prefers deliveries left with building security, never at the door.", "category": "preference"},
             {"text": "Customer is vegetarian and avoids purchasing leather items.", "category": "profile"}
@@ -35,7 +36,7 @@ DEFAULT_CUSTOMERS = [
         "id": "vikram_nair",
         "name": "Vikram Nair",
         "memories": [
-            {"text": "Customer reported a desk lamp marked delivered was missing; escalation is open.", "category": "issue"},
+            {"text": "Customer reported a desk lamp (order ORD-2290) marked delivered but never received; escalation is open.", "category": "issue"},
             {"text": "Customer was promised a free replacement desk lamp.", "category": "commitment"},
             {"text": "Customer works late-night shifts and requested delivery drivers call only before 11:00 AM.", "category": "preference"},
             {"text": "Customer lives in a gated community requiring couriers to check in at the front gate.", "category": "profile"}
@@ -45,7 +46,7 @@ DEFAULT_CUSTOMERS = [
         "id": "fatima_sheikh",
         "name": "Fatima Sheikh",
         "memories": [
-            {"text": "Customer is waiting on a refund for returned running shoes.", "category": "issue"},
+            {"text": "Customer is waiting on a refund for returned running shoes (order ORD-5512, wrong size).", "category": "issue"},
             {"text": "Customer was issued a 500 INR store credit as an apology for shipping delays.", "category": "commitment"},
             {"text": "Customer prefers receiving updates via WhatsApp.", "category": "preference"},
             {"text": "Customer primarily purchases kids' clothing and toys as gifts.", "category": "profile"}
