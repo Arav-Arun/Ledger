@@ -8,7 +8,7 @@ from memory import llm_chat
 from prompts import AGENT_SYSTEM, REVISE_SYSTEM
 
 
-def respond(customer_name: str, messages: list[dict], memory_block: str, customer_id: str) -> str:
+def respond(customer_name: str, messages: list[dict], memory_block: str) -> str:
     """Draft one reply: history (ending with the latest user message) -> reply."""
     msgs: list = [{
         "role": "system",

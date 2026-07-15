@@ -40,22 +40,46 @@ Executes before every reply to retrieve relevant context.
 
 ```mermaid
 flowchart LR
-    M(["Message"]) --> E["Embed"] --> V["Vector Search"] --> RK["Blended Rerank"] --> TOP["Top Facts"] --> AG[["Agent"]]
+    M(["Message"]) --> E["Embed"] --> V["Hybrid Retrieval"] --> RK["Blended Rerank"] --> TOP["Top Facts"] --> AG[["Agent"]]
 ```
 
-1. **Vector Retrieval**: Fetches a candidate pool using cosine similarity search, on a query contextualised with the customer's recent turns.
-2. **Contextual Reranking**: Reorders the pool with a **deterministic blended score** — cosine relevance + a category importance prior (open commitments and live issues outrank stable profile facts) + recency decay + light keyword overlap — and drops anything below a relevance floor. No LLM in the hot path; every weight and threshold is an explicit, env-overridable constant.
+1. **Hybrid Retrieval**: Fetches a candidate pool that unions the vector-nearest memories (cosine, on a query contextualised with the customer's recent turns) with keyword/ID matches — so an exact order id recalls its memory even when it isn't in the vector top-k.
+2. **Contextual Reranking**: Reorders the pool with a **deterministic blended score** — cosine relevance + a category importance prior (open commitments and live issues outrank stable profile facts) + recency decay + keyword overlap — and drops anything below a relevance floor (a keyword/ID hit bypasses the floor). No LLM in the hot path; every weight and threshold is an explicit, env-overridable constant.
 
 ---
 
 ## Core Features
 
 - **Cross-session Recall**: Retains user preferences and active issues across distinct sessions.
+- **Hybrid Retrieval**: Unions dense vector search with keyword/ID matching, so exact tokens (order numbers, ticket ids) recall their memory even when embeddings rank them low.
 - **Contextual Reranking**: Blends semantic relevance with category importance, recency, and keyword overlap — so open commitments and live issues surface ahead of equally-similar background facts — rather than relying exclusively on static semantic similarity. Deterministic and reproducible; no LLM in the retrieval path.
-- **Grounded Replies (demo harness)**: The sample assistant drafts a reply, a grader scores it against an explicit grounding rubric, and it revises until the rubric passes or a hard iteration cap is hit. The check **fails closed** — a reply is only marked "grounded" if every criterion explicitly passed — and an ungrounded reply is never learned into long-term memory. The per-turn verdict trail is shown in the UI.
+- **Grounded Replies (demo harness)**: The sample assistant drafts a reply, a grader scores it against an explicit grounding rubric, and it revises until the rubric passes or a hard iteration cap is hit. The check **fails closed** — a reply is only marked "grounded" if every criterion explicitly passed — and an ungrounded reply is withheld from the memory-writer (its content is not turned into stored facts). The per-turn verdict trail is shown in the UI.
 - **Append-only Audit Trail**: Maintains a complete history of all memory operations (ADD, UPDATE, DELETE) and the originating message source.
 - **Time-bound Facts (TTL)**: Supports expiration dates for automated fact lapsing.
 - **PII Scrubbing**: Applies deterministic pattern matching and Luhn checks to prevent sensitive data ingestion.
+
+---
+
+## Repository Layout
+
+```
+server/                FastAPI backend + the memory engine
+  main.py              API routes (/api/*) and app wiring
+  memory.py            the engine: write path (extract → reconcile) + read path (hybrid retrieve → rerank)
+  store.py             Postgres/pgvector access — memories, event ledger, sessions, messages
+  grounding.py         draft → grade-against-rubric → revise loop for the demo assistant
+  agent.py             the assistant's two LLM moves: draft a reply, revise a flagged one
+  prompts.py           every LLM system prompt, in one place
+  scrub.py             deterministic PII redaction (card/OTP/PIN) before text is stored
+  seed.py              loads the demo customers and their memories
+  tests/               deterministic unit tests (stub the LLM/DB — no keys needed)
+ui/src/                React + Vite frontend
+  App.tsx              customer picker, onboarding form, page layout
+  Chat.tsx             chat panel + the grounding verdict trail
+  MemoryPanel.tsx      live view of a customer's memories and each fact's history
+  SessionsPanel.tsx    per-customer session list
+  api.ts               typed client for the backend
+```
 
 ---
 

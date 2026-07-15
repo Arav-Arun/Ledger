@@ -7,6 +7,7 @@ export default defineConfig({
   server: {
     // Honor the port assigned by the harness/env; fall back to Vite's default.
     port: process.env.PORT ? Number(process.env.PORT) : undefined,
-    proxy: { "/api": "http://localhost:8000" },
+    // API dev server port; defaults to 8000, override with LEDGER_API_PORT if 8000 is taken.
+    proxy: { "/api": `http://localhost:${process.env.LEDGER_API_PORT ?? 8000}` },
   },
 });

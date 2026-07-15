@@ -2,18 +2,20 @@
 
 Write path:  add()    conversation turn -> extract facts -> scrub PII ->
                       compare with similar memories -> ADD/UPDATE/DELETE/NOOP -> journal
-Read path:   search() query -> vector search (scoped to customer) -> deterministic
-                      blended rerank (relevance + importance + recency + lexical) with a
-                      relevance floor. No LLM in the hot path.
+Read path:   search() query -> hybrid retrieval (vector nearest + keyword/id match,
+                      scoped to customer) -> deterministic blended rerank
+                      (relevance + importance + recency + lexical) with a relevance
+                      floor that keyword hits bypass. No LLM in the hot path.
 """
 
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, timezone
 
 from openai import OpenAI
-from pydantic import BaseModel, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ValidationError, field_validator
 
 import store
 from prompts import DECIDE_SYSTEM, EXTRACT_SYSTEM
@@ -220,24 +222,31 @@ def reconcile(customer_id: str, candidates: list[Candidate], source: str) -> lis
     return events
 
 
-# ---------- read path: scoped search + deterministic blended rerank ----------
+# ---------- read path: hybrid retrieval + deterministic blended rerank ----------
 #
 # Deterministic-first, mirroring the write path's gate(): the read path ranks with plain,
-# auditable Python arithmetic - no LLM in the hot path. Vector search fetches a candidate
-# pool; the rerank then BLENDS four signals so recall isn't "whatever is nearest in cosine
-# space". Every weight and threshold is an explicit, env-overridable constant (house style,
-# like SIM_ADD_BELOW), so the ranking can be tuned and reasoned about without touching code.
+# auditable Python arithmetic - no LLM in the hot path.
+#
+# Retrieval is HYBRID (store.hybrid_candidates): the vector-nearest memories UNIONed with
+# any whose text matches a salient query term (an order id, a keyword). Dense search alone
+# can bury an exact-token match once a customer outgrows the fetch cap; the keyword arm
+# recovers it - the classic reason production RAG fuses lexical + dense.
+#
+# The rerank then BLENDS four signals so recall isn't "whatever is nearest in cosine space".
+# Every weight and threshold is an explicit, env-overridable constant (house style, like
+# SIM_ADD_BELOW), so the ranking can be tuned and reasoned about without touching code.
 #
 #   relevance  - cosine similarity to the (conversation-contextualised) query
 #   importance - a per-category prior: an open commitment or a live issue matters more to
 #                the current turn than a stable profile fact or a one-off episode
 #   recency    - exponential decay on the memory's age, so fresh facts edge out stale ones
-#   lexical    - token overlap with the query/recent turns; a cheap hybrid signal so an
-#                order number or ID typed verbatim isn't lost to fuzzy dense similarity
+#   lexical    - token overlap with the query/recent turns; the same keyword signal, as a
+#                ranking nudge
 #
-# A relevance FLOOR drops memories that aren't actually about this query (a real filter,
-# not just a reorder). If a query is so generic that nothing clears the floor, we fall back
-# to ranking the whole pool rather than starving the reply of context.
+# A relevance FLOOR drops memories that aren't actually about this query (a real filter, not
+# just a reorder) - but a keyword/id hit bypasses it, so an exact match is never floored out
+# for having mediocre cosine. If a query is so generic that nothing survives, we fall back to
+# ranking the whole pool rather than starving the reply of context.
 
 RERANK_FETCH = int(os.getenv("LEDGER_RERANK_FETCH", "15"))
 
@@ -264,6 +273,33 @@ CATEGORY_PRIOR = {
 DEFAULT_PRIOR = 0.4
 
 
+# Words and identifiers, punctuation stripped: "ORD-5512," -> "ord-5512". Shared by the
+# lexical signal and the keyword-retrieval terms so both tokenise the same way.
+_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9\-]*")
+
+
+def _tokens(text: str) -> set[str]:
+    return set(_TOKEN_RE.findall(text.lower()))
+
+
+def _recent_user_text(recent: list[dict], query: str) -> str:
+    """This query plus the customer's last few turns - the context the lexical signals see."""
+    parts = [query] + [m["content"] for m in (recent or [])[-3:] if m.get("role") == "user"]
+    return " ".join(parts)
+
+
+def _salient_terms(recent: list[dict], query: str, limit: int = 8) -> list[str]:
+    """Distinctive tokens worth a keyword match - order ids and content words, not stopwords
+    like "the"/"on". Used both to widen retrieval and to bypass the relevance floor."""
+    out: list[str] = []
+    for t in _TOKEN_RE.findall(_recent_user_text(recent, query).lower()):
+        if (len(t) >= 4 or any(c.isdigit() for c in t)) and t not in out:
+            out.append(t)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _recency_decay(when, now: datetime) -> float:
     """0..1 exponential decay on a memory's age; unknown timestamps score neutrally."""
     if not isinstance(when, datetime):
@@ -277,20 +313,15 @@ def _recency_decay(when, now: datetime) -> float:
 
 def _lexical_overlap(text: str, terms: set[str]) -> float:
     """Jaccard token overlap between a memory and the query/recent-turn terms (0..1)."""
-    toks = set(_norm(text).split())
+    toks = _tokens(text)
     if not toks or not terms:
         return 0.0
     return len(toks & terms) / len(toks | terms)
 
 
 def _context_terms(recent: list[dict], query: str) -> set[str]:
-    """The keyword bag the lexical signal matches against: this query plus the customer's
-    last few turns, so an ID mentioned a message or two ago still helps."""
-    parts = [query] + [m["content"] for m in (recent or [])[-3:] if m.get("role") == "user"]
-    terms: set[str] = set()
-    for p in parts:
-        terms |= set(_norm(p).split())
-    return terms
+    """The keyword bag the lexical ranking signal matches against."""
+    return _tokens(_recent_user_text(recent, query))
 
 
 def _contextual_query(recent: list[dict], query: str) -> str:
@@ -319,10 +350,15 @@ def contextual_rerank(recent: list[dict], query: str, rows: list[dict], k: int,
         return []
     now = now or datetime.now(timezone.utc)
     terms = _context_terms(recent, query)
+    salient = set(_salient_terms(recent, query))
     for r in rows:
         r["score"] = round(_blended_score(r, terms, now), 4)
 
-    kept = [r for r in rows if float(r.get("similarity") or 0.0) >= RELEVANCE_FLOOR]
+    # Keep a memory if it clears the cosine floor OR shares a salient term (order id/keyword)
+    # with the query - a keyword hit is relevant regardless of how fuzzy its embedding is.
+    kept = [r for r in rows
+            if float(r.get("similarity") or 0.0) >= RELEVANCE_FLOOR
+            or (salient & _tokens(r.get("text", "")))]
     if not kept:
         # nothing is clearly on-topic (e.g. a broad "what do you know about me?"); rank the
         # whole pool rather than returning nothing.
@@ -348,10 +384,11 @@ class Memory:
 
     def search(self, query: str, customer_id: str, recent: list[dict] | None = None, k: int = 6) -> list[dict]:
         store.expire_sweep(customer_id)
-        # Fetch a candidate pool by vector similarity to the conversation-contextualised
-        # query, then rerank deterministically (relevance + importance + recency + lexical).
+        # Hybrid retrieval: vector-nearest to the conversation-contextualised query, UNIONed
+        # with keyword/id matches, then a deterministic blended rerank with a relevance floor.
         pool_query = _contextual_query(recent or [], query)
-        rows = store.similar_memories(customer_id, embed([pool_query])[0], k=RERANK_FETCH)
+        patterns = [f"%{t}%" for t in _salient_terms(recent or [], query)]
+        rows = store.hybrid_candidates(customer_id, embed([pool_query])[0], patterns, RERANK_FETCH)
         reranked = contextual_rerank(recent or [], query, rows, k)
         return [
             {"id": r["id"], "text": r["text"], "category": r["category"],

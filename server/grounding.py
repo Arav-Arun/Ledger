@@ -180,7 +180,7 @@ def answer(customer_name: str, messages: list[dict], memory_block: str,
     evidence = _evidence(memory_block, messages)
 
     # step 2: draft an answer from the evidence
-    draft = agent.respond(customer_name, messages, memory_block, customer_id)
+    draft = agent.respond(customer_name, messages, memory_block)
 
     trail: list[dict] = []
     best_key = None            # (fully_passed, n_criteria_passed) - higher is better

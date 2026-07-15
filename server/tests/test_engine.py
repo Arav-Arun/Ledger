@@ -199,10 +199,31 @@ def test_search_returns_scored_floored_topk(monkeypatch):
     monkeypatch.setattr(memory.store, "expire_sweep", lambda cid: None)
     rows = [_row("keep-1", "commitment", 0.7), _row("keep-2", "issue", 0.5),
             _row("drop", "profile", 0.02)]
-    monkeypatch.setattr(memory.store, "similar_memories", lambda cid, emb, k: rows)
+    monkeypatch.setattr(memory.store, "hybrid_candidates", lambda cid, emb, patterns, k: rows)
 
     out = memory.Memory().search("any news?", "c1", recent=[], k=6)
     ids = [r["id"] for r in out]
     assert "drop" not in ids
     assert all("score" in r for r in out)
     assert out[0]["id"] == "keep-1"  # commitment, highest blended score
+
+
+# --------------------------------------------------------------------------
+# Hybrid retrieval: salient-term extraction (drives the keyword arm + floor bypass).
+# --------------------------------------------------------------------------
+
+def test_salient_terms_keeps_ids_and_content_words_drops_stopwords():
+    terms = memory._salient_terms([], "any update on ORD-5512?")
+    assert "ord-5512" in terms          # order id (punctuation stripped, lowercased)
+    assert "update" in terms            # content word
+    assert "on" not in terms and "any" not in terms  # short/stopword-ish tokens dropped
+
+
+def test_rerank_keeps_low_similarity_keyword_match():
+    # An exact-id match with poor cosine must survive the floor; an unrelated sub-floor row must not.
+    rows = [_row("order ORD-5512 wrong size, refund pending", "issue", 0.05),
+            _row("totally unrelated background fact", "profile", 0.03)]
+    out = memory.contextual_rerank([], "any update on ORD-5512?", rows, k=6, now=NOW)
+    ids = [r["id"] for r in out]
+    assert "order ORD-5512 wrong size, refund pending" in ids
+    assert "totally unrelated background fact" not in ids

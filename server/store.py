@@ -235,7 +235,7 @@ def get_memories(customer_id: str) -> list[dict]:
 
 
 def similar_memories(customer_id: str, embedding: list[float], k: int = 5) -> list[dict]:
-    """Performs a pgvector cosine similarity search (`<=>`) on active, non-expired 
+    """Performs a pgvector cosine similarity search (`<=>`) on active, non-expired
     memories for a customer. Returns up to k elements sorted by similarity.
     """
     v = _vec(embedding)
@@ -247,6 +247,34 @@ def similar_memories(customer_id: str, embedding: list[float], k: int = 5) -> li
            ORDER BY embedding <=> %s::vector
            LIMIT %s""",
         (v, customer_id, v, k),
+    )
+
+
+def hybrid_candidates(customer_id: str, embedding: list[float],
+                      patterns: list[str], k: int) -> list[dict]:
+    """Read-path candidate retrieval: the k nearest memories by vector distance, UNIONed
+    with any memories whose text matches a salient query term (an order id, a keyword).
+
+    Dense similarity alone can bury an exact-token match once a customer has more memories
+    than the fetch cap; the keyword arm recovers it. Cosine `similarity` is returned for
+    every row (keyword hits included) so the reranker can score them on the same scale.
+    `patterns` are SQL ILIKE patterns (e.g. `%ord-5512%`); an empty list is a plain dense
+    search.
+    """
+    v = _vec(embedding)
+    return _q(
+        """WITH scored AS (
+               SELECT id::text AS id, text, category, created_at, updated_at,
+                      1 - (embedding <=> %s::vector) AS similarity
+               FROM memories
+               WHERE customer_id = %s AND active AND (expires_at IS NULL OR expires_at > now())
+           ),
+           dense AS (SELECT * FROM scored ORDER BY similarity DESC LIMIT %s),
+           lexical AS (SELECT * FROM scored WHERE text ILIKE ANY(%s::text[]) LIMIT %s)
+           SELECT DISTINCT ON (id) id, text, category, created_at, updated_at, similarity
+           FROM (SELECT * FROM dense UNION ALL SELECT * FROM lexical) u
+           ORDER BY id, similarity DESC""",
+        (v, customer_id, k, patterns, k),
     )
 
 
