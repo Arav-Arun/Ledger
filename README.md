@@ -1,8 +1,16 @@
 # Ledger
 
-Ledger is a memory engine for conversational AI. It provides LLMs with long-term memory capabilities by observing conversations, extracting factual data, reconciling new facts with existing records, and recalling relevant context dynamically.
+Long-term memory for conversational AI. Ledger watches a conversation, extracts durable
+facts about the user, reconciles them against what it already knows, and recalls the
+relevant ones on future turns — across separate sessions.
 
-Ledger is designed as memory infrastructure. The repository includes a sample store-support bot serving as a demonstration harness for the core engine.
+The design is **deterministic-first**: the parts that decide behaviour (PII scrubbing, the
+reconcile gate, the retrieval rerank) are plain, auditable Python. The LLM is used only
+where judgement is genuinely needed — extracting facts and resolving conflicts in the
+gray zone. No LLM runs in the retrieval hot path.
+
+The repo ships a customer-support bot as a demonstration harness; the reusable part is the
+engine in `server/memory.py` and `server/store.py`.
 
 ---
 
@@ -14,116 +22,163 @@ Ledger is designed as memory infrastructure. The repository includes a sample st
 
 ---
 
-## Architecture
+## The memory model
 
-Ledger operates between the user and the agent using two pipelines connected to a PostgreSQL database with the pgvector extension.
+Every fact is one row in `memories`, scoped to a customer:
 
-### 1. The Write Path (Learning)
-Executes after every agent reply to update long-term knowledge.
+| Field | Purpose |
+|-------|---------|
+| `text` | The fact, atomic and third-person (`"Customer prefers email over phone."`). |
+| `category` | `issue` · `commitment` · `preference` · `profile` · `episode`. Drives the importance prior at recall. |
+| `embedding` | `vector(1536)` (OpenAI `text-embedding-3-small`), for cosine search. |
+| `active` | Soft-delete flag. Deletes flip this to `false`; rows are never destroyed. |
+| `expires_at` | Optional TTL for time-bound facts (a trip, a temporary hold). Swept on access. |
 
-```mermaid
-flowchart LR
-    T(["Turn"]) --> S["Scrub PII"] --> X["Extract Facts"] --> E["Embed"] --> R{"Reconcile"} --> DB[("Postgres")]
-```
-
-1. **Scrub PII**: Deterministically redacts credit card numbers, OTPs, and PINs prior to LLM processing.
-2. **Extract**: Converts the conversation exchange into atomic, self-contained facts.
-3. **Reconcile**: Evaluates new facts against existing vector memories and performs a deterministic operation:
-   - **ADD**: Inserts a new fact.
-   - **UPDATE**: Modifies an existing fact if contradicted or refined.
-   - **DELETE**: Removes an obsolete or resolved fact.
-   - **NOOP**: Takes no action for duplicates or noise.
-4. **Journal**: Logs every mutation in an append-only audit trail (`memory_events`).
-
-### 2. The Read Path (Recalling)
-Executes before every reply to retrieve relevant context.
-
-```mermaid
-flowchart LR
-    M(["Message"]) --> E["Embed"] --> V["Hybrid Retrieval"] --> RK["Blended Rerank"] --> TOP["Top Facts"] --> AG[["Agent"]]
-```
-
-1. **Hybrid Retrieval**: Fetches a candidate pool that unions the vector-nearest memories (cosine, on a query contextualised with the customer's recent turns) with keyword/ID matches — so an exact order id recalls its memory even when it isn't in the vector top-k.
-2. **Contextual Reranking**: Reorders the pool with a **deterministic blended score** — cosine relevance + a category importance prior (open commitments and live issues outrank stable profile facts) + recency decay + keyword overlap — and drops anything below a relevance floor (a keyword/ID hit bypasses the floor). No LLM in the hot path; every weight and threshold is an explicit, env-overridable constant.
+Every mutation also appends a row to `memory_events` (`ADD` / `UPDATE` / `DELETE` /
+`EXPIRE`) with the old text, the new text, and the **source message that caused it** — an
+append-only audit trail written in the same transaction as the mutation, so the two can
+never disagree.
 
 ---
 
-## Core Features
+## Write path — learning from a turn
 
-- **Cross-session Recall**: Retains user preferences and active issues across distinct sessions.
-- **Hybrid Retrieval**: Unions dense vector search with keyword/ID matching, so exact tokens (order numbers, ticket ids) recall their memory even when embeddings rank them low.
-- **Contextual Reranking**: Blends semantic relevance with category importance, recency, and keyword overlap — so open commitments and live issues surface ahead of equally-similar background facts — rather than relying exclusively on static semantic similarity. Deterministic and reproducible; no LLM in the retrieval path.
-- **Grounded Replies (demo harness)**: The sample assistant drafts a reply, a grader scores it against an explicit grounding rubric, and it revises until the rubric passes or a hard iteration cap is hit. The check **fails closed** — a reply is only marked "grounded" if every criterion explicitly passed — and an ungrounded reply is withheld from the memory-writer (its content is not turned into stored facts). The per-turn verdict trail is shown in the UI.
-- **Append-only Audit Trail**: Maintains a complete history of all memory operations (ADD, UPDATE, DELETE) and the originating message source.
-- **Time-bound Facts (TTL)**: Supports expiration dates for automated fact lapsing.
-- **PII Scrubbing**: Applies deterministic pattern matching and Luhn checks to prevent sensitive data ingestion.
+Runs after each assistant reply. `memory.py` → `add()`.
+
+```mermaid
+flowchart LR
+    T(["Turn"]) --> S["Scrub PII"] --> X["Extract facts (LLM)"] --> E["Embed"] --> G{"Gate"} --> DB[("Postgres")]
+```
+
+1. **Scrub** — deterministic regex + Luhn checksum strips card numbers, OTP/CVV/PIN, and
+   keyword-introduced account numbers *before* text reaches the LLM or the DB. Order ids
+   (`ORD-5512`) are deliberately kept. (`scrub.py`)
+2. **Extract** — the one exchange becomes 0–8 atomic, third-person candidate facts, each
+   with a category and optional expiry. Small talk yields an empty list. (`prompts.EXTRACT_SYSTEM`)
+3. **Reconcile** — each candidate is embedded and matched against its nearest existing
+   memories, then a deterministic **gate** decides the operation, calling the LLM only when
+   it must:
+
+   | Gate condition | Operation | LLM? |
+   |----------------|-----------|------|
+   | No neighbours exist | `ADD` | no |
+   | Normalised text exactly matches a neighbour | `NOOP` | no |
+   | Top cosine similarity ≤ `0.55` (`SIM_ADD_BELOW`) | `ADD` | no |
+   | Otherwise (the gray zone) | LLM adjudicates → `ADD` / `UPDATE` / `DELETE` / `NOOP` | yes |
+
+   `UPDATE` rewrites a fact in place (a changed city, a switched channel); `DELETE`
+   soft-removes one that is now resolved or cancelled. There is intentionally no
+   high-similarity auto-`NOOP`: two near-identical sentences can still contradict
+   (`"lives in Delhi"` vs `"lives in Mumbai"`), so only an exact restatement is a safe
+   deterministic skip.
+4. **Journal** — the mutation and its `memory_events` row commit together.
+
+Only a **grounded** assistant reply is learned from (see below); an unverified draft's
+content is withheld so a hallucinated specific can't be laundered into permanent memory.
 
 ---
 
-## Repository Layout
+## Read path — recalling for a turn
+
+Runs before each reply, fully deterministic. `memory.py` → `search()`.
+
+```mermaid
+flowchart LR
+    M(["Query"]) --> C["Contextualise + embed"] --> H["Hybrid retrieval"] --> RK["Blended rerank + floor"] --> TOP["Top-k"] --> AG[["Agent"]]
+```
+
+1. **Contextualise** — the query is prepended with the customer's previous turn before
+   embedding, so recall reflects the conversation, not one message in isolation.
+2. **Hybrid retrieval** — the vector-nearest memories are **unioned** with any whose text
+   matches a salient query term (an order id, a keyword). Dense search alone can bury an
+   exact-token match once a customer outgrows the fetch cap; the keyword arm recovers it.
+   (`store.hybrid_candidates`)
+3. **Blended rerank** — each candidate gets a deterministic score, no LLM:
+
+   ```
+   score = 1.00·relevance  +  0.35·importance  +  0.20·recency  +  0.25·lexical
+   ```
+
+   *relevance* = cosine to the contextualised query · *importance* = a per-category prior
+   (an open `commitment` or live `issue` outranks a stable `profile` fact) · *recency* =
+   exponential decay (45-day half-life) · *lexical* = token overlap with the query. Every
+   weight and threshold is an env-overridable constant.
+4. **Relevance floor** — memories below `0.20` cosine are dropped as off-topic, *unless*
+   they share a salient term with the query (an exact id hit is never floored out). If a
+   query is so broad that nothing clears the floor, the whole pool is ranked rather than
+   starving the reply. The top `k` (default 6) are returned, each carrying its `score`.
+
+---
+
+## Grounded replies (demo harness)
+
+The sample assistant drafts a reply, a grader scores it against an explicit **rubric**
+(no invented customer facts, no contradiction, asks when a fact is unknown), and it revises
+until the rubric passes or a hard iteration cap (2 rewrites) is hit. The rubric is plain
+data in one place; a plain Python rule — not the LLM — decides whether a draft ships.
+
+The check **fails closed**: a reply is marked `grounded` only if the grader returned an
+explicit pass on *every* criterion. A missing verdict, wrong shape, or grader outage counts
+as not-grounded, never a silent pass. The full per-attempt verdict trail is returned and
+shown in the UI. (`grounding.py`)
+
+---
+
+## Repository layout
 
 ```
 server/                FastAPI backend + the memory engine
-  main.py              API routes (/api/*) and app wiring
-  memory.py            the engine: write path (extract → reconcile) + read path (hybrid retrieve → rerank)
+  memory.py            the engine: write path (extract → gate → reconcile) + read path (hybrid retrieve → rerank)
   store.py             Postgres/pgvector access — memories, event ledger, sessions, messages
+  scrub.py             deterministic PII redaction (card/OTP/PIN) via regex + Luhn
   grounding.py         draft → grade-against-rubric → revise loop for the demo assistant
   agent.py             the assistant's two LLM moves: draft a reply, revise a flagged one
   prompts.py           every LLM system prompt, in one place
-  scrub.py             deterministic PII redaction (card/OTP/PIN) before text is stored
-  seed.py              loads the demo customers and their memories
+  main.py              API routes (/api/*) and app wiring
+  seed.py              loads the six demo customers and their memories
 ui/src/                React + Vite frontend
   App.tsx              customer picker, onboarding form, page layout
   Chat.tsx             chat panel + the grounding verdict trail
-  MemoryPanel.tsx      live view of a customer's memories and each fact's history
+  MemoryPanel.tsx      live memory view and each fact's audit trail
   SessionsPanel.tsx    per-customer session list
   api.ts               typed client for the backend
 ```
 
 ---
 
-## Demonstration Guide
+## Local setup
 
-The included UI provides a memory inspection panel to observe engine behavior. Recommended test cases:
+**Prerequisites:** Python 3.11+, Node.js 20+, an OpenAI API key, and a PostgreSQL
+connection string with the `pgvector` extension available (e.g. Supabase).
 
-1. **Cross-session recall**: Ask "Any news on my return?" as the Priya profile. (Recalls RET-4821 automatically).
-2. **Contradiction (UPDATE)**: Send "Leave parcels at my front door now." (Rewrites the existing preference in place).
-3. **PII Scrubbing**: Send "My card is 4111 1111 1111 1111". (Data is instantly redacted and excluded from storage).
-4. **Noise filtering (NOOP)**: Send "Morning, hope you are well." (Small talk is ignored; no facts are created).
-
----
-
-## Local Installation
-
-**Prerequisites:** Python 3.11+, Node.js 20+, an OpenAI API Key, and a PostgreSQL connection string with the pgvector extension enabled.
-
-### Backend Setup
+### Backend
 ```bash
 cd server
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
-# Add OPENAI_API_KEY and DATABASE_URL to .env
+cp .env.example .env          # then set OPENAI_API_KEY and DATABASE_URL
+python seed.py                # create tables + load the six demo customers
 uvicorn main:app --reload --env-file .env
 ```
 
-### Frontend Setup
+### Frontend
 ```bash
 cd ui
 npm install
-npm run dev
+npm run dev                   # proxies /api to the backend (port 8000 by default)
 ```
 
 ---
 
-## API Reference
+## API reference
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET/POST | `/api/customers` | List or create customers |
-| POST | `/api/sessions` | Initialize a new session |
-| GET | `/api/customers/{id}/sessions` | List sessions for a specific customer |
-| POST | `/api/chat` | Submit a conversation turn |
-| GET | `/api/memories/{id}` | Retrieve active memories |
-| GET | `/api/memory/{id}/history` | Retrieve the audit ledger for a specific memory |
+| GET / POST | `/api/customers` | List or create customers |
+| POST | `/api/sessions` | Start a session |
+| GET | `/api/customers/{id}/sessions` | List a customer's sessions |
+| POST | `/api/chat` | Submit a turn → reply, memories recalled, ops applied, grounding trail |
+| GET | `/api/memories/{id}` | Active memories for a customer |
+| GET | `/api/memory/{id}/history` | Audit trail for one memory |
+| DELETE | `/api/memory/{id}` | Forget a fact (soft-delete) |
