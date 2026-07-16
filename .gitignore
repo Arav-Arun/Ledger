@@ -9,8 +9,9 @@ dist/
 .agents/
 .DS_Store
 
-# Local demo/sales walkthrough, kept off the public repo
+# Local demo/sales walkthrough + comparison notes, kept off the public repo
 DEMO_WALKTHROUGH.md
+MEM0_COMPARISON.md
 
 # Tests kept for local dev, off the public product repo
 server/tests/
