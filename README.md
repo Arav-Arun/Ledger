@@ -72,7 +72,6 @@ server/                FastAPI backend + the memory engine
   prompts.py           every LLM system prompt, in one place
   scrub.py             deterministic PII redaction (card/OTP/PIN) before text is stored
   seed.py              loads the demo customers and their memories
-  tests/               deterministic unit tests (stub the LLM/DB — no keys needed)
 ui/src/                React + Vite frontend
   App.tsx              customer picker, onboarding form, page layout
   Chat.tsx             chat panel + the grounding verdict trail

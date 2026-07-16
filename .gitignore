@@ -11,3 +11,6 @@ dist/
 
 # Local demo/sales walkthrough, kept off the public repo
 DEMO_WALKTHROUGH.md
+
+# Tests kept for local dev, off the public product repo
+server/tests/
