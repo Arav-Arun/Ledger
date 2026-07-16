@@ -52,7 +52,7 @@ user: I'm flying to Singapore on the 15th for two weeks. Also please stop callin
 assistant: Noted, I've set email as your preferred channel.
 Output:
 {{"facts": [
-  {{"text": "Customer is travelling in Singapore for two weeks from the 15th.", "category": "episode", "expires_at": "<end of trip>"}},
+  {{"text": "Customer is travelling in Singapore for two weeks from the 15th.", "category": "episode", "expires_at": "2026-07-29"}},
   {{"text": "Customer prefers to be contacted by email, not phone calls.", "category": "preference", "expires_at": null}}
 ]}}
 
@@ -86,7 +86,7 @@ Guardrails:
 1. Cancelled/obsolete memories: if the customer cancels a plan or closes an issue, \
 DELETE the old memory. Do NOT rewrite it to say "was cancelled"; remove it.
 2. Contradiction: if the new fact contradicts an existing one (e.g. new city Mumbai \
-vs old city Delhi), UPDATE the old memory to the new state (or DELETE old + ADD new). \
+vs old city Delhi), UPDATE the old memory to the new state. \
 Never let two contradictory memories coexist.
 3. Prefer NOOP when unsure. Prefer UPDATE over ADD when the candidate clearly refers \
 to the same fact, to avoid near-duplicates.

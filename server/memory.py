@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import threading
 from datetime import date, datetime, timezone
 
 from openai import OpenAI
@@ -33,12 +34,17 @@ EMBED_MODEL = os.getenv("LEDGER_EMBED_MODEL", "text-embedding-3-small")
 LEDGER_SEED = int(os.getenv("LEDGER_SEED", "7"))
 
 _client: OpenAI | None = None
+_client_lock = threading.Lock()
 
 
 def client() -> OpenAI:
     global _client
+    # Double-checked lock: FastAPI runs sync endpoints in a threadpool, so two threads
+    # could otherwise race to build the client on the first request.
     if _client is None:
-        _client = OpenAI()
+        with _client_lock:
+            if _client is None:
+                _client = OpenAI()
     return _client
 
 
@@ -104,7 +110,14 @@ def extract_facts(recent: list[dict], user_msg: str, assistant_msg: str) -> list
         f"Earlier in this session:\n{context or '(session start)'}\n\n"
         f"Latest exchange:\nuser: {user_msg}\nassistant: {assistant_msg}"
     )
-    raw = _llm_json(EXTRACT_SYSTEM.format(today=date.today().isoformat()), prompt)
+    try:
+        raw = _llm_json(EXTRACT_SYSTEM.format(today=date.today().isoformat()), prompt)
+    except Exception as e:
+        # Fail open: a malformed/failed extraction call must not crash the chat turn.
+        # (decide_one and the grader already guard their own _llm_json calls; this is
+        # the one extraction call that previously let a JSONDecodeError propagate.)
+        log.warning("fact extraction failed, learning nothing this turn: %s", e)
+        return []
 
     facts: list[Candidate] = []
     for item in (raw.get("facts") or [])[:MAX_FACTS_PER_TURN]:
@@ -194,8 +207,13 @@ def gate(candidate: Candidate, neighbors: list[dict]) -> Decision:
 def reconcile(customer_id: str, candidates: list[Candidate], source: str) -> list[dict]:
     """Apply the pipeline for each candidate; returns UI-friendly event dicts."""
     events: list[dict] = []
-    for c in candidates:
-        embedding = embed([c.text])[0]
+    if not candidates:
+        return events
+    # Embed all candidate texts in ONE API call, then reconcile each in turn. The neighbour
+    # search still runs per-candidate against the live store, so intra-turn dedup (a later
+    # candidate seeing an earlier one just inserted) is unaffected.
+    embeddings = embed([c.text for c in candidates])
+    for c, embedding in zip(candidates, embeddings):
         neighbors = store.similar_memories(customer_id, embedding, k=5)
         d = gate(c, neighbors)
 
@@ -207,13 +225,13 @@ def reconcile(customer_id: str, candidates: list[Candidate], source: str) -> lis
 
         elif d.op == "UPDATE":
             new_text = (d.text or c.text).strip()
-            old = next(n["text"] for n in neighbors if n["id"] == d.target_id)
+            old = next((n["text"] for n in neighbors if n["id"] == d.target_id), None)
             store.update_memory(d.target_id, new_text, embed([new_text])[0], source)
             events.append({"op": "UPDATE", "memory_id": d.target_id,
                            "text": new_text, "old_text": old})
 
         elif d.op == "DELETE":
-            old = next(n["text"] for n in neighbors if n["id"] == d.target_id)
+            old = next((n["text"] for n in neighbors if n["id"] == d.target_id), None)
             store.deactivate_memory(d.target_id, "DELETE", source)
             events.append({"op": "DELETE", "memory_id": d.target_id, "text": old})
 

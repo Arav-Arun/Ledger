@@ -1,5 +1,6 @@
-"""Deterministic PII scrub: strip card numbers, OTP, CVV, PIN before text reaches
-the LLM or the store. The prompt refuses secrets too; this doesn't trust it to.
+"""Deterministic PII scrub: strip card numbers, OTP, CVV, PIN, account numbers and
+SSNs before text reaches the LLM or the store. The prompt refuses secrets too; this
+doesn't trust it to.
 """
 
 import re
@@ -14,6 +15,18 @@ KEYWORD_RE = re.compile(
     r"\b(otp|cvv|cvc|pin|password|passcode)\b(?:\s*(?:is|was|:|-|=))?\s*\S+",
     re.IGNORECASE,
 )
+
+# Account numbers are structureless digits (indistinguishable from an order id), so -
+# like OTP/PIN - we only redact them when introduced by an explicit account keyword
+# followed by a run of >=7 digits. This avoids nuking phrases like "my account is locked".
+ACCOUNT_RE = re.compile(
+    r"\b(?:account|acct|a/c)\b(?:\s*(?:number|no\.?|#|is|was|:|-|=))*\s*(\d[\d -]{5,}\d)",
+    re.IGNORECASE,
+)
+
+# US Social Security numbers have a fixed, self-identifying shape, so a bare pattern
+# match is safe enough to redact without a leading keyword.
+SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 
 
 def luhn_valid(digits: str) -> bool:
@@ -59,13 +72,26 @@ def scrub(text: str) -> tuple[str, list[str]]:
 
     def redact_keyword(m: re.Match) -> str:
         """Regex replacement callback for authentication keywords (OTP, passwords).
-        
+
         Replaces the matched secret with a secure placeholder string.
         """
         found.append(m.group(1).lower())
         return f"[{m.group(1).lower()} removed]"
 
-    # Run the regex substitutions for cards and secret keywords
+    def redact_account(m: re.Match) -> str:
+        """Redacts the digit run of an account number, keeping the surrounding keyword."""
+        found.append("account number")
+        return m.group().replace(m.group(1), "[account number removed]")
+
+    def redact_ssn(m: re.Match) -> str:
+        """Regex replacement callback for US Social Security numbers."""
+        found.append("ssn")
+        return "[ssn removed]"
+
+    # Run the regex substitutions. Cards first so a Luhn-valid card that also follows an
+    # "account" keyword is caught as a card; then keyword secrets, account numbers, SSNs.
     clean = CARD_RE.sub(redact_card, text)
     clean = KEYWORD_RE.sub(redact_keyword, clean)
+    clean = ACCOUNT_RE.sub(redact_account, clean)
+    clean = SSN_RE.sub(redact_ssn, clean)
     return clean, found

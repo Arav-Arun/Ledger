@@ -4,10 +4,13 @@ Plain SQL over a small psycopg pool. Vectors go in as pgvector literals;
 similarity search happens in SQL (`<=>` is cosine distance).
 """
 
+import logging
 import os
 
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
+
+log = logging.getLogger("ledger.store")
 
 SCHEMA = """
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -71,8 +74,14 @@ _pool: ConnectionPool | None = None
 def pool() -> ConnectionPool:
     global _pool
     if _pool is None:
+        url = os.environ.get("DATABASE_URL")
+        if not url:
+            raise RuntimeError(
+                "DATABASE_URL is not set - add it to server/.env "
+                "(a Postgres connection string with the pgvector extension available)."
+            )
         _pool = ConnectionPool(
-            os.environ["DATABASE_URL"],
+            url,
             min_size=1,
             max_size=5,
             open=True,
@@ -108,12 +117,30 @@ def init() -> None:
                              "in your database (requires superuser or rds_superuser)."
                         ) from e
                     raise
-        # Auto-migration: drop column and fix type mismatch if migrating from old version
+        # Auto-migration from older schema versions. Best-effort per statement: an
+        # already-migrated DB no-ops, but a genuine failure is now logged instead of
+        # vanishing silently (and one bad step no longer blocks the others).
+        for label, migration in (
+            ("drop legacy importance column",
+             "ALTER TABLE memories DROP COLUMN IF EXISTS importance;"),
+            ("coerce memory_id to uuid",
+             "ALTER TABLE memory_events ALTER COLUMN memory_id TYPE UUID USING memory_id::uuid;"),
+        ):
+            try:
+                conn.execute(migration)
+            except Exception as e:
+                log.warning("auto-migration step skipped (%s): %s", label, e)
+
+        # Approximate-nearest-neighbour index for the vector search. Requires pgvector
+        # >= 0.5 (HNSW); if it can't be built we log and fall back to the exact scan the
+        # queries already perform, so search still works, just without index acceleration.
         try:
-            conn.execute("ALTER TABLE memories DROP COLUMN IF EXISTS importance;")
-            conn.execute("ALTER TABLE memory_events ALTER COLUMN memory_id TYPE UUID USING memory_id::uuid;")
-        except Exception:
-            pass
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_embedding "
+                "ON memories USING hnsw (embedding vector_cosine_ops) WHERE active;"
+            )
+        except Exception as e:
+            log.warning("HNSW vector index not created; using exact search: %s", e)
 
 
 def _vec(embedding: list[float]) -> str:
@@ -165,62 +192,80 @@ def list_customers() -> list[dict]:
 def insert_memory(customer_id: str, text: str, category: str,
                   embedding: list[float], expires_at=None, source: str = "") -> str:
     """Inserts a new vector-embedded memory for a customer.
-    
-    Also logs the addition to the memory audit event log.
+
+    The row and its ADD ledger event are written in one transaction, so the audit
+    trail can never disagree with the memories table (no orphaned row or event).
     """
-    mid = _q(
-        """INSERT INTO memories (customer_id, text, category, embedding, expires_at)
-           VALUES (%s, %s, %s, %s::vector, %s) RETURNING id::text""",
-        (customer_id, text, category, _vec(embedding), expires_at),
-    )[0]["id"]
-    log_event(mid, customer_id, "ADD", None, text, source)
+    with pool().connection() as conn:
+        with conn.transaction():
+            mid = conn.execute(
+                """INSERT INTO memories (customer_id, text, category, embedding, expires_at)
+                   VALUES (%s, %s, %s, %s::vector, %s) RETURNING id::text""",
+                (customer_id, text, category, _vec(embedding), expires_at),
+            ).fetchall()[0]["id"]
+            _log_event(conn, mid, customer_id, "ADD", None, text, source)
     return mid
 
 
 def update_memory(memory_id: str, new_text: str, embedding: list[float], source: str = "") -> None:
     """Updates the text content and embedding vector of an active memory.
-    
-    Also appends an update event to the memory audit event log.
+
+    The read, write, and ledger event run in one transaction with the row locked
+    (FOR UPDATE), so a concurrent deactivate cannot slip in between the active-check
+    and the write (no TOCTOU); the UPDATE itself also re-checks `active`.
     """
-    old = _q("SELECT customer_id, text FROM memories WHERE id = %s::uuid AND active", (memory_id,))
-    if not old:
-        return
-    _q(
-        """UPDATE memories
-           SET text = %s, embedding = %s::vector, updated_at = now()
-           WHERE id = %s::uuid RETURNING id""",
-        (new_text, _vec(embedding), memory_id),
-    )
-    log_event(memory_id, old[0]["customer_id"], "UPDATE", old[0]["text"], new_text, source)
+    with pool().connection() as conn:
+        with conn.transaction():
+            old = conn.execute(
+                "SELECT customer_id, text FROM memories WHERE id = %s::uuid AND active FOR UPDATE",
+                (memory_id,),
+            ).fetchall()
+            if not old:
+                return
+            conn.execute(
+                """UPDATE memories
+                   SET text = %s, embedding = %s::vector, updated_at = now()
+                   WHERE id = %s::uuid AND active""",
+                (new_text, _vec(embedding), memory_id),
+            )
+            _log_event(conn, memory_id, old[0]["customer_id"], "UPDATE", old[0]["text"], new_text, source)
 
 
 def deactivate_memory(memory_id: str, op: str = "DELETE", source: str = "") -> None:
     """Soft-deletes a memory by setting active = false.
-    
-    Documents the deletion with a record in the memory events audit table.
+
+    The soft-delete and its ledger event are written in one transaction, so the
+    deletion is always recorded (or not applied at all).
     """
-    rows = _q(
-        """UPDATE memories SET active = false, updated_at = now()
-           WHERE id = %s::uuid AND active
-           RETURNING customer_id, text""",
-        (memory_id,),
-    )
-    if rows:
-        log_event(memory_id, rows[0]["customer_id"], op, rows[0]["text"], None, source)
+    with pool().connection() as conn:
+        with conn.transaction():
+            rows = conn.execute(
+                """UPDATE memories SET active = false, updated_at = now()
+                   WHERE id = %s::uuid AND active
+                   RETURNING customer_id, text""",
+                (memory_id,),
+            ).fetchall()
+            if rows:
+                _log_event(conn, memory_id, rows[0]["customer_id"], op, rows[0]["text"], None, source)
 
 
 def expire_sweep(customer_id: str) -> None:
-    """Sweeps and soft-deletes all memories for a customer that have passed
-    their expiry date. Logs EXPIRE event for each affected memory.
+    """Sweeps and soft-deletes all memories for a customer that have passed their
+    expiry date, logging an EXPIRE event per affected memory.
+
+    The sweep and all its ledger events share one transaction, so a mid-sweep crash
+    can't leave some rows flipped without their matching EXPIRE events.
     """
-    rows = _q(
-        """UPDATE memories SET active = false, updated_at = now()
-           WHERE customer_id = %s AND active AND expires_at <= now()
-           RETURNING id::text, text""",
-        (customer_id,),
-    )
-    for r in rows:
-        log_event(r["id"], customer_id, "EXPIRE", r["text"], None, "expiry sweep")
+    with pool().connection() as conn:
+        with conn.transaction():
+            rows = conn.execute(
+                """UPDATE memories SET active = false, updated_at = now()
+                   WHERE customer_id = %s AND active AND expires_at <= now()
+                   RETURNING id::text, text""",
+                (customer_id,),
+            ).fetchall()
+            for r in rows:
+                _log_event(conn, r["id"], customer_id, "EXPIRE", r["text"], None, "expiry sweep")
 
 
 def get_memories(customer_id: str) -> list[dict]:
@@ -280,13 +325,23 @@ def hybrid_candidates(customer_id: str, embedding: list[float],
 
 # -- the ledger (audit log) --------------------------------------------------
 
-def log_event(memory_id: str, customer_id: str, op: str,
-              old_text: str | None, new_text: str | None, source: str) -> None:
-    _q(
+def _log_event(conn, memory_id: str, customer_id: str, op: str,
+               old_text: str | None, new_text: str | None, source: str) -> None:
+    """Append one row to the audit ledger on an EXISTING connection, so it shares the
+    caller's transaction with the memory mutation it describes."""
+    conn.execute(
         """INSERT INTO memory_events (memory_id, customer_id, op, old_text, new_text, source)
-           VALUES (%s::uuid, %s, %s, %s, %s, %s) RETURNING id""",
+           VALUES (%s::uuid, %s, %s, %s, %s, %s)""",
         (memory_id, customer_id, op, old_text, new_text, (source or "")[:500]),
     )
+
+
+def log_event(memory_id: str, customer_id: str, op: str,
+              old_text: str | None, new_text: str | None, source: str) -> None:
+    """Standalone ledger append (opens its own connection). The in-module mutations use
+    _log_event to stay in one transaction; this wrapper exists for any external caller."""
+    with pool().connection() as conn:
+        _log_event(conn, memory_id, customer_id, op, old_text, new_text, source)
 
 
 def memory_history(memory_id: str) -> list[dict]:
