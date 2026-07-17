@@ -2,10 +2,10 @@
 
 Write path:  add()    conversation turn -> extract facts -> scrub PII ->
                       compare with similar memories -> ADD/UPDATE/DELETE/NOOP -> journal
-Read path:   search() query -> hybrid retrieval (vector nearest + keyword/id match,
-                      scoped to customer) -> deterministic blended rerank
-                      (relevance + importance + recency + lexical) with a relevance
-                      floor that keyword hits bypass. No LLM in the hot path.
+Read path:   search() query -> retrieve this customer's memories, nearest first ->
+                      deterministic blended rerank (relevance + importance + recency
+                      + lexical) with a relevance floor that keyword hits bypass.
+                      No LLM in the hot path.
 """
 
 import json
@@ -182,6 +182,17 @@ def decide_one(candidate: Candidate, neighbors: list[dict]) -> Decision:
 # duplicate safely. The only deterministic NOOP is an exact (normalised) restatement.
 SIM_ADD_BELOW = float(os.getenv("LEDGER_SIM_ADD_BELOW", "0.55"))
 
+# How many existing memories a candidate is reconciled against. This is a CORRECTNESS
+# knob, not a cost one, and it is the write path's mirror of RERANK_FETCH: the window is
+# what the gate below can see, and anything outside it may as well not exist. Too narrow
+# is a silent growth bug - if a candidate's true contradiction ranks just outside the
+# window, nothing adjudicates the conflict and BOTH facts get stored, which DECIDE_SYSTEM
+# guardrails 2 and 4 explicitly forbid ("Never let two contradictory memories coexist").
+# The failure mode is invisible: no error, just a store that quietly stops deduplicating
+# as a customer accumulates facts. The LLM never sees this whole window - gate() sends it
+# only the genuinely-similar slice - so widening it costs one larger SQL read, not tokens.
+NEIGHBOR_FETCH = int(os.getenv("LEDGER_NEIGHBOR_FETCH", "20"))
+
 
 def _norm(text: str) -> str:
     return " ".join(text.lower().split())
@@ -193,6 +204,11 @@ def gate(candidate: Candidate, neighbors: list[dict]) -> Decision:
     - Exact word-for-word duplicate: always NOOP.
     - Cosine similarity below threshold: always ADD (no near facts exist).
     - Otherwise: ask LLM to adjudicate conflicts/updates.
+
+    `neighbors` is the full NEIGHBOR_FETCH window (sorted nearest first). The deterministic
+    checks scan all of it; only the slice above SIM_ADD_BELOW is handed to the LLM, so a
+    wider window makes dedup stricter while making the adjudication payload *smaller* -
+    it drops the sub-threshold padding the LLM was previously sent as context.
     """
     if not neighbors:
         return Decision(op="ADD")                     # empty store -> new
@@ -201,7 +217,8 @@ def gate(candidate: Candidate, neighbors: list[dict]) -> Decision:
         return Decision(op="NOOP")                     # exact restatement already stored
     if neighbors[0]["similarity"] <= SIM_ADD_BELOW:
         return Decision(op="ADD")                      # nothing close enough to reconcile
-    return decide_one(candidate, neighbors)            # gray zone -> LLM adjudicates
+    contenders = [n for n in neighbors if n["similarity"] > SIM_ADD_BELOW]
+    return decide_one(candidate, contenders)           # gray zone -> LLM adjudicates
 
 
 def reconcile(customer_id: str, candidates: list[Candidate], source: str) -> list[dict]:
@@ -214,7 +231,7 @@ def reconcile(customer_id: str, candidates: list[Candidate], source: str) -> lis
     # candidate seeing an earlier one just inserted) is unaffected.
     embeddings = embed([c.text for c in candidates])
     for c, embedding in zip(candidates, embeddings):
-        neighbors = store.similar_memories(customer_id, embedding, k=5)
+        neighbors = store.similar_memories(customer_id, embedding, k=NEIGHBOR_FETCH)
         d = gate(c, neighbors)
 
         if d.op == "ADD":
@@ -240,15 +257,16 @@ def reconcile(customer_id: str, candidates: list[Candidate], source: str) -> lis
     return events
 
 
-# ---------- read path: hybrid retrieval + deterministic blended rerank ----------
+# ---------- read path: retrieval + deterministic blended rerank ----------
 #
 # Deterministic-first, mirroring the write path's gate(): the read path ranks with plain,
 # auditable Python arithmetic - no LLM in the hot path.
 #
-# Retrieval is HYBRID (store.hybrid_candidates): the vector-nearest memories UNIONed with
-# any whose text matches a salient query term (an order id, a keyword). Dense search alone
-# can bury an exact-token match once a customer outgrows the fetch cap; the keyword arm
-# recovers it - the classic reason production RAG fuses lexical + dense.
+# Retrieval (store.similar_memories) hands the reranker this customer's memories, nearest
+# first. The pool is deliberately GENEROUS rather than tight, because selecting the pool on
+# one signal and then ranking it on four is a silent truncation: a fact the blend would have
+# picked never gets the chance if a hard cosine cap dropped it first. A pool that doesn't
+# bind in practice makes the blend below the only thing that decides recall.
 #
 # The rerank then BLENDS four signals so recall isn't "whatever is nearest in cosine space".
 # Every weight and threshold is an explicit, env-overridable constant (house style, like
@@ -261,12 +279,22 @@ def reconcile(customer_id: str, candidates: list[Candidate], source: str) -> lis
 #   lexical    - token overlap with the query/recent turns; the same keyword signal, as a
 #                ranking nudge
 #
-# A relevance FLOOR drops memories that aren't actually about this query (a real filter, not
-# just a reorder) - but a keyword/id hit bypasses it, so an exact match is never floored out
-# for having mediocre cosine. If a query is so generic that nothing survives, we fall back to
-# ranking the whole pool rather than starving the reply of context.
+# A relevance FLOOR drops memories that aren't actually about this query - but a keyword/id
+# hit bypasses it, so an exact match is never floored out for having mediocre cosine. Be
+# clear about how much work the floor really does now that the pool is generous: a common
+# query word ("order", "refund") is a salient term, so it waves plenty of memories straight
+# past the floor. It trims the obviously off-topic tail; it is not a strong filter, and it is
+# not what picks the top k - the blend is. That is the intended division of labour, and it is
+# why the blend, not the floor, is the thing worth tuning. If a query is so generic that
+# nothing survives, we rank the whole pool rather than starving the reply of context.
 
-RERANK_FETCH = int(os.getenv("LEDGER_RERANK_FETCH", "15"))
+# Size of the candidate pool handed to the rerank. A SAFETY VALVE, not a quality knob: it
+# is set so it does not bind for a real customer, so the blend ranks every fact they have.
+# The non-relevance weights sum to at most 0.35 + 0.20 + 0.25 = 0.80, so a memory can trail
+# the cosine leader by up to 0.80 and still win the blend - routine inside a top-15 pool
+# (which is what this used to be), vanishingly unlikely inside a top-500. If it ever does
+# bind, we degrade to the 500 nearest rather than starving the blend.
+RERANK_FETCH = int(os.getenv("LEDGER_RERANK_FETCH", "500"))
 
 # A candidate must clear this cosine similarity to count as relevant to the query at all.
 RELEVANCE_FLOOR = float(os.getenv("LEDGER_RELEVANCE_FLOOR", "0.20"))
@@ -301,9 +329,16 @@ def _tokens(text: str) -> set[str]:
 
 
 def _recent_user_text(recent: list[dict], query: str) -> str:
-    """This query plus the customer's last few turns - the context the lexical signals see."""
-    parts = [query] + [m["content"] for m in (recent or [])[-3:] if m.get("role") == "user"]
-    return " ".join(parts)
+    """This query plus the customer's last three turns - the context the lexical signals see.
+
+    Filter to the customer's turns and THEN take the last three. Slicing the last three
+    messages first and keeping whichever happened to be theirs is not the same thing: with
+    roles alternating, that window holds one or two customer turns, so the signal saw less
+    context than the name promises. _contextual_query already reads this history the
+    filter-then-slice way; the two now agree.
+    """
+    users = [m["content"] for m in (recent or []) if m.get("role") == "user"]
+    return " ".join([query] + users[-3:])
 
 
 def _salient_terms(recent: list[dict], query: str, limit: int = 8) -> list[str]:
@@ -402,11 +437,11 @@ class Memory:
 
     def search(self, query: str, customer_id: str, recent: list[dict] | None = None, k: int = 6) -> list[dict]:
         store.expire_sweep(customer_id)
-        # Hybrid retrieval: vector-nearest to the conversation-contextualised query, UNIONed
-        # with keyword/id matches, then a deterministic blended rerank with a relevance floor.
+        # Retrieve nearest to the conversation-contextualised query, then rank the pool with
+        # the deterministic blend + relevance floor. The pool is generous (see RERANK_FETCH),
+        # so the blend - not a cosine pre-filter - is what decides what the agent sees.
         pool_query = _contextual_query(recent or [], query)
-        patterns = [f"%{t}%" for t in _salient_terms(recent or [], query)]
-        rows = store.hybrid_candidates(customer_id, embed([pool_query])[0], patterns, RERANK_FETCH)
+        rows = store.similar_memories(customer_id, embed([pool_query])[0], RERANK_FETCH)
         reranked = contextual_rerank(recent or [], query, rows, k)
         return [
             {"id": r["id"], "text": r["text"], "category": r["category"],

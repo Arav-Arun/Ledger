@@ -56,8 +56,11 @@ flowchart LR
 2. **Extract** — the one exchange becomes 0–8 atomic, third-person candidate facts, each
    with a category and optional expiry. Small talk yields an empty list. (`prompts.EXTRACT_SYSTEM`)
 3. **Reconcile** — each candidate is embedded and matched against its nearest existing
-   memories, then a deterministic **gate** decides the operation, calling the LLM only when
-   it must:
+   memories (`NEIGHBOR_FETCH`, default 20), then a deterministic **gate** decides the
+   operation, calling the LLM only when it must. The window is a *correctness* knob, not a
+   cost one: the gate can only adjudicate what retrieval hands it, so a contradiction
+   ranked outside the window is never seen and both facts get stored. The LLM is shown only
+   the slice above `SIM_ADD_BELOW`, so a wider window costs a bigger SQL read, not tokens.
 
    | Gate condition | Operation | LLM? |
    |----------------|-----------|------|
@@ -84,15 +87,15 @@ Runs before each reply, fully deterministic. `memory.py` → `search()`.
 
 ```mermaid
 flowchart LR
-    M(["Query"]) --> C["Contextualise + embed"] --> H["Hybrid retrieval"] --> RK["Blended rerank + floor"] --> TOP["Top-k"] --> AG[["Agent"]]
+    M(["Query"]) --> C["Contextualise + embed"] --> H["Retrieve pool"] --> RK["Blended rerank + floor"] --> TOP["Top-k"] --> AG[["Agent"]]
 ```
 
 1. **Contextualise** — the query is prepended with the customer's previous turn before
    embedding, so recall reflects the conversation, not one message in isolation.
-2. **Hybrid retrieval** — the vector-nearest memories are **unioned** with any whose text
-   matches a salient query term (an order id, a keyword). Dense search alone can bury an
-   exact-token match once a customer outgrows the fetch cap; the keyword arm recovers it.
-   (`store.hybrid_candidates`)
+2. **Retrieve the pool** — this customer's active memories, nearest first, cosine attached.
+   The pool is deliberately generous (`RERANK_FETCH`, default 500) rather than tight: a pool
+   selected on cosine alone and then ranked on four signals silently truncates away facts the
+   blend would have picked. The cap is a safety valve, not a quality knob. (`store.similar_memories`)
 3. **Blended rerank** — each candidate gets a deterministic score, no LLM:
 
    ```

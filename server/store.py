@@ -125,22 +125,28 @@ def init() -> None:
              "ALTER TABLE memories DROP COLUMN IF EXISTS importance;"),
             ("coerce memory_id to uuid",
              "ALTER TABLE memory_events ALTER COLUMN memory_id TYPE UUID USING memory_id::uuid;"),
+            # There is deliberately NO vector index (this drops the HNSW one earlier
+            # versions built). Every query here is scoped to one customer, and
+            # `customer_id` is far more selective than the vector search, so the plan we
+            # want is: narrow by idx_memories_customer, then scan that customer's rows
+            # exactly. An HNSW index over every customer's vectors cannot serve that -
+            # it is built for a global nearest-neighbour search we never issue.
+            #
+            # It was not merely useless, it was a hazard. pgvector defaults
+            # `hnsw.iterative_scan` to off, so an HNSW scan combined with a selective
+            # filter that isn't in the index (our customer_id) can return FEWER rows than
+            # the LIMIT asked for. Silently. If the planner ever picked it, the write
+            # path's neighbour window would come back short or empty, gate() would take
+            # `if not neighbors: return ADD`, and reconciliation would degrade to
+            # append-only with no error raised - unbounded growth caused by an index.
+            # It also cost an HNSW insert on every single memory write.
+            ("drop unused hnsw vector index",
+             "DROP INDEX IF EXISTS idx_memories_embedding;"),
         ):
             try:
                 conn.execute(migration)
             except Exception as e:
                 log.warning("auto-migration step skipped (%s): %s", label, e)
-
-        # Approximate-nearest-neighbour index for the vector search. Requires pgvector
-        # >= 0.5 (HNSW); if it can't be built we log and fall back to the exact scan the
-        # queries already perform, so search still works, just without index acceleration.
-        try:
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_memories_embedding "
-                "ON memories USING hnsw (embedding vector_cosine_ops) WHERE active;"
-            )
-        except Exception as e:
-            log.warning("HNSW vector index not created; using exact search: %s", e)
 
 
 def _vec(embedding: list[float]) -> str:
@@ -282,6 +288,11 @@ def get_memories(customer_id: str) -> list[dict]:
 def similar_memories(customer_id: str, embedding: list[float], k: int = 5) -> list[dict]:
     """Performs a pgvector cosine similarity search (`<=>`) on active, non-expired
     memories for a customer. Returns up to k elements sorted by similarity.
+
+    Both paths use this: the write path takes a small k (the neighbours to reconcile
+    against), the read path takes a large one (the pool to rerank - see
+    memory.RERANK_FETCH). The `customer_id` filter is far more selective than the vector
+    search, so this is an exact scan over one customer's rows either way.
     """
     v = _vec(embedding)
     return _q(
@@ -292,34 +303,6 @@ def similar_memories(customer_id: str, embedding: list[float], k: int = 5) -> li
            ORDER BY embedding <=> %s::vector
            LIMIT %s""",
         (v, customer_id, v, k),
-    )
-
-
-def hybrid_candidates(customer_id: str, embedding: list[float],
-                      patterns: list[str], k: int) -> list[dict]:
-    """Read-path candidate retrieval: the k nearest memories by vector distance, UNIONed
-    with any memories whose text matches a salient query term (an order id, a keyword).
-
-    Dense similarity alone can bury an exact-token match once a customer has more memories
-    than the fetch cap; the keyword arm recovers it. Cosine `similarity` is returned for
-    every row (keyword hits included) so the reranker can score them on the same scale.
-    `patterns` are SQL ILIKE patterns (e.g. `%ord-5512%`); an empty list is a plain dense
-    search.
-    """
-    v = _vec(embedding)
-    return _q(
-        """WITH scored AS (
-               SELECT id::text AS id, text, category, created_at, updated_at,
-                      1 - (embedding <=> %s::vector) AS similarity
-               FROM memories
-               WHERE customer_id = %s AND active AND (expires_at IS NULL OR expires_at > now())
-           ),
-           dense AS (SELECT * FROM scored ORDER BY similarity DESC LIMIT %s),
-           lexical AS (SELECT * FROM scored WHERE text ILIKE ANY(%s::text[]) LIMIT %s)
-           SELECT DISTINCT ON (id) id, text, category, created_at, updated_at, similarity
-           FROM (SELECT * FROM dense UNION ALL SELECT * FROM lexical) u
-           ORDER BY id, similarity DESC""",
-        (v, customer_id, k, patterns, k),
     )
 
 
