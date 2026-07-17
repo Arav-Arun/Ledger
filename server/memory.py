@@ -193,6 +193,14 @@ SIM_ADD_BELOW = float(os.getenv("LEDGER_SIM_ADD_BELOW", "0.55"))
 # only the genuinely-similar slice - so widening it costs one larger SQL read, not tokens.
 NEIGHBOR_FETCH = int(os.getenv("LEDGER_NEIGHBOR_FETCH", "20"))
 
+# Ceiling on the one category that grows without bound. The gate above makes the others
+# self-limiting: preference/profile facts are UPDATEd in place when they change, and
+# issue/commitment track real events a customer actually raises. `episode` is genuinely
+# additive - a new trip does not overwrite an older one, and expires_at is optional, so an
+# undated episode would otherwise live forever. Without this ceiling, "memory growth is
+# bounded" is true of every category except the one that never stops growing.
+MAX_EPISODES_PER_CUSTOMER = int(os.getenv("LEDGER_MAX_EPISODES", "200"))
+
 
 def _norm(text: str) -> str:
     return " ".join(text.lower().split())
@@ -254,6 +262,12 @@ def reconcile(customer_id: str, candidates: list[Candidate], source: str) -> lis
 
         else:
             events.append({"op": "NOOP", "text": c.text})
+
+    # Enforce the episode ceiling after this turn's ops, so the facts just learned are
+    # counted. Deterministic and journalled: eviction is a memory op like any other, and
+    # it shows up in the ledger and the UI rather than rows quietly disappearing.
+    for r in store.evict_surplus_episodes(customer_id, MAX_EPISODES_PER_CUSTOMER):
+        events.append({"op": "EVICT", "memory_id": r["id"], "text": r["text"]})
     return events
 
 

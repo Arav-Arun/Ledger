@@ -47,7 +47,7 @@ Runs after each assistant reply. `memory.py` → `add()`.
 
 ```mermaid
 flowchart LR
-    T(["Turn"]) --> S["Scrub PII"] --> X["Extract facts (LLM)"] --> E["Embed"] --> G{"Gate"} --> DB[("Postgres")]
+    T(["Turn"]) --> S["Scrub PII"] --> X["Extract facts (LLM)"] --> E["Embed"] --> G{"Gate"} --> DB[("Postgres")] --> C["Cap episodes"]
 ```
 
 1. **Scrub** — deterministic regex + Luhn checksum strips card numbers, OTP/CVV/PIN, and
@@ -75,6 +75,14 @@ flowchart LR
    (`"lives in Delhi"` vs `"lives in Mumbai"`), so only an exact restatement is a safe
    deterministic skip.
 4. **Journal** — the mutation and its `memory_events` row commit together.
+5. **Cap** — the gate makes most categories self-limiting: a preference or profile fact is
+   `UPDATE`d in place when it changes (one address, however many times someone moves), and
+   issues/commitments track real events a customer raises. `episode` is the only genuinely
+   additive category — a new trip doesn't overwrite an older one, and its TTL is optional —
+   so it carries a per-customer ceiling (`MAX_EPISODES_PER_CUSTOMER`, default 200) with
+   oldest-first eviction, journalled as `EVICT` like any other op. Open commitments are
+   deliberately never evicted: silently forgetting an obligation made to a customer is
+   worse than carrying a stale one.
 
 Only a **grounded** assistant reply is learned from (see below); an unverified draft's
 content is withheld so a hallucinated specific can't be laundered into permanent memory.

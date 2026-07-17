@@ -87,6 +87,7 @@ export const OP_STYLE: Record<string, string> = {
   UPDATE: "bg-amber-100 text-amber-800",
   DELETE: "bg-red-100 text-red-700",
   EXPIRE: "bg-slate-200 text-slate-600",
+  EVICT: "bg-slate-200 text-slate-600",
   NOOP: "bg-slate-100 text-slate-500",
 };
 

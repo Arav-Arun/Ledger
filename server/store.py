@@ -274,6 +274,41 @@ def expire_sweep(customer_id: str) -> None:
                 _log_event(conn, r["id"], customer_id, "EXPIRE", r["text"], None, "expiry sweep")
 
 
+def evict_surplus_episodes(customer_id: str, keep: int) -> list[dict]:
+    """Cap the one category that grows without bound; the newest `keep` survive.
+
+    Growth is otherwise self-limiting. A preference or profile fact is UPDATEd in place
+    when it changes, so a customer who moves five times still has one address memory, and
+    issue/commitment track real events a customer actually raises. `episode` is the only
+    genuinely additive category - a new trip does not overwrite an older one, and its
+    expires_at is optional, set only when the fact can be dated - so it is the only one
+    that needs a ceiling.
+
+    Evicts oldest-first and journals an EVICT per row in the same transaction, so a fact
+    never leaves without the ledger recording why. Deliberately scoped to episodes: an
+    open commitment is an obligation we made to a customer, and silently forgetting one is
+    worse than carrying it stale.
+    """
+    with pool().connection() as conn:
+        with conn.transaction():
+            rows = conn.execute(
+                """UPDATE memories SET active = false, updated_at = now()
+                   WHERE id IN (
+                       SELECT id FROM memories
+                       WHERE customer_id = %s AND active AND category = 'episode'
+                         AND (expires_at IS NULL OR expires_at > now())
+                       ORDER BY created_at DESC
+                       OFFSET %s
+                   )
+                   RETURNING id::text, text""",
+                (customer_id, keep),
+            ).fetchall()
+            for r in rows:
+                _log_event(conn, r["id"], customer_id, "EVICT", r["text"], None,
+                           f"episode cap of {keep} exceeded")
+    return rows
+
+
 def get_memories(customer_id: str) -> list[dict]:
     """Queries all active and non-expired memories for a customer ordered by recency."""
     return _q(
