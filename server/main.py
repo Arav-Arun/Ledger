@@ -123,8 +123,19 @@ def chat(body: ChatBody):
     # draft -> grade against the rubric -> revise until grounded or the cap is hit.
     # `grounding_trail` is every attempt and its per-criterion verdict, for the UI/audit;
     # `grounded` is True only if the reply passed every rubric criterion.
-    reply, grounding_trail, grounded = grounding.answer(
-        customer["name"], history, memory_block, body.customer_id)
+    #
+    # Drafting the reply is the one step in this handler that hard-depends on the LLM (recall
+    # and grading already degrade gracefully). If it fails - an OpenAI outage, a missing or
+    # invalid key, no access to the chat model, a timeout - return a clear 502 whose detail
+    # names the cause, instead of the opaque 500 the raw exception would produce, and log the
+    # full traceback for the operator. The exception TYPE is safe to surface (e.g.
+    # AuthenticationError, RateLimitError, NotFoundError); the message may not be.
+    try:
+        reply, grounding_trail, grounded = grounding.answer(
+            customer["name"], history, memory_block, body.customer_id)
+    except Exception as e:
+        log.exception("assistant generation failed for %s", body.customer_id)
+        raise HTTPException(502, f"assistant temporarily unavailable: {type(e).__name__}")
     store.add_message(body.session_id, "assistant", reply)
 
     # Only learn from a reply that passed grounding. An ungrounded draft may contain
