@@ -354,26 +354,4 @@ cd server
 | GET | `/api/customers/{id}/memories-as-of?t=<iso>` | Point-in-time recall reconstructed from the log. |
 | GET | `/api/memory/{id}/history` | Audit trail for one memory. |
 | DELETE | `/api/memory/{id}` | Forget a fact (soft-delete). |
-
----
-
-## Limitations and roadmap
-
-Real gaps, each weighed against the deterministic design rather than added for parity:
-
-- **Flat facts, no entity graph.** Memories are per-customer strings with no links between them.
-  Entity and relationship edges (the Zep and mem0-graph capability) would enable multi-hop
-  recall; how that fits a deterministic, auditable store is the open design question.
-- **No consolidation.** Episodes are capped and evicted, never summarised into a durable digest.
-  A periodic, logged consolidation pass is a natural fit.
-- **Single provider, single scope.** OpenAI is hardcoded and memory is scoped only by customer.
-  A pluggable embedder/LLM boundary and session or agent scopes are additive.
-- **No retrieval eval harness.** The deterministic core is unit-tested, but recall quality has no
-  benchmark (nothing LOCOMO or LongMemEval style). A fixed-corpus eval would make ranking changes
-  measurable, and it fits the design because the read path is deterministic.
-
----
-
-## License
-
-See the repository for license details.
+]]
