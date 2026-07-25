@@ -267,7 +267,7 @@ function GroundingPanel(props: { grounding: GroundingAttempt[]; grounded?: boole
                   </span>
                   <span className="text-slate-500">
                     <span className="font-medium text-slate-600">{RUBRIC_LABEL[c.name] ?? c.name}</span>
-                    {!c.passed && c.reason ? ` — ${c.reason}` : ""}
+                    {!c.passed && c.reason ? ` - ${c.reason}` : ""}
                   </span>
                 </div>
               ))}

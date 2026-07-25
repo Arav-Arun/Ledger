@@ -6,6 +6,7 @@ similarity search happens in SQL (`<=>` is cosine distance).
 
 import logging
 import os
+import re
 
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -47,8 +48,7 @@ CREATE TABLE IF NOT EXISTS memory_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_memory ON memory_events (memory_id);
--- customer_id is how the ledger is swept for erasure (delete_customer) and reconstructed
--- point-in-time (memories_as_of); without this those are seq scans over every event ever.
+-- customer_id is how the ledger is swept for erasure and reconstructed point-in-time
 CREATE INDEX IF NOT EXISTS idx_events_customer ON memory_events (customer_id, created_at);
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -115,7 +115,11 @@ def ping() -> None:
 
 def init() -> None:
     with pool().connection() as conn:
-        for stmt in SCHEMA.split(";"):
+        # Strip SQL line comments before the naive split on ';', so a semicolon inside a
+        # comment can never be mistaken for a statement terminator. The SCHEMA is DDL only
+        # (no string literals contain '--'), so this substitution is safe.
+        schema = re.sub(r"--[^\n]*", "", SCHEMA)
+        for stmt in schema.split(";"):
             if stmt.strip():
                 try:
                     conn.execute(stmt)
