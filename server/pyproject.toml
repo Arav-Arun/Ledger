@@ -1,0 +1,20 @@
+[project]
+name = "ledger-memory"
+version = "0.1.0"
+description = "Deterministic-first long-term memory engine for conversational AI."
+requires-python = ">=3.11"
+# Runtime dependencies are pinned in requirements.txt, which stays the canonical install
+# path documented in the README. This file exists for tooling (ruff, pytest) and metadata.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# The house style uses long, essay-length explanatory comments on purpose; don't fight them.
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

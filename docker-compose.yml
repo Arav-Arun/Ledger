@@ -1,0 +1,37 @@
+# Local turn-key stack: Postgres (with pgvector) + the Ledger server (API + built UI).
+#
+#   OPENAI_API_KEY=sk-... docker compose up --build
+#   docker compose exec server python seed.py      # load the six demo customers
+#
+# Then open http://localhost:8000.
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger
+    ports:
+      - "5432:5432"
+    volumes:
+      - ledger-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://ledger:ledger@db:5432/ledger
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in your shell or a .env file}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  ledger-db:

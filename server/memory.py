@@ -33,6 +33,20 @@ EMBED_MODEL = os.getenv("LEDGER_EMBED_MODEL", "text-embedding-3-small")
 # system_fingerprint if you need to detect model drift.
 LEDGER_SEED = int(os.getenv("LEDGER_SEED", "7"))
 
+# Width of the stored vector column (store.SCHEMA declares vector(1536)). Pointing
+# LEDGER_EMBED_MODEL at a model of a different dimensionality (e.g. text-embedding-3-large
+# is 3072) would otherwise fail deep inside Postgres on every insert with an opaque error;
+# embed() validates against this so the mismatch surfaces once, clearly, at the boundary.
+# Changing the embedding model is a schema migration, not just an env flip.
+EMBED_DIM = int(os.getenv("LEDGER_EMBED_DIM", "1536"))
+
+# Every OpenAI call sits in the request path, so bound it. The SDK default timeout is 10
+# minutes - far too long for an interactive turn: one stalled call would pin a threadpool
+# worker (and, transitively, a DB connection) until it gave up. A couple of retries smooth
+# over transient 5xx/timeouts without turning a hang into an unbounded wait.
+OPENAI_TIMEOUT = float(os.getenv("LEDGER_OPENAI_TIMEOUT", "30"))
+OPENAI_MAX_RETRIES = int(os.getenv("LEDGER_OPENAI_MAX_RETRIES", "2"))
+
 _client: OpenAI | None = None
 _client_lock = threading.Lock()
 
@@ -44,13 +58,23 @@ def client() -> OpenAI:
     if _client is None:
         with _client_lock:
             if _client is None:
-                _client = OpenAI()
+                _client = OpenAI(timeout=OPENAI_TIMEOUT, max_retries=OPENAI_MAX_RETRIES)
     return _client
 
 
 def embed(texts: list[str]) -> list[list[float]]:
     resp = client().embeddings.create(model=EMBED_MODEL, input=texts)
-    return [d.embedding for d in resp.data]
+    vectors = [d.embedding for d in resp.data]
+    # Guard the dimension at the boundary (see EMBED_DIM): a wrong-width vector is a
+    # configuration error, not a runtime condition to paper over.
+    for v in vectors:
+        if len(v) != EMBED_DIM:
+            raise RuntimeError(
+                f"{EMBED_MODEL} returned a {len(v)}-dimensional embedding but the store "
+                f"expects {EMBED_DIM} (store.SCHEMA declares vector({EMBED_DIM})). Changing "
+                f"the embedding model requires migrating the memories.embedding column."
+            )
+    return vectors
 
 
 def llm_chat(messages: list, tools: list | None = None):
@@ -455,7 +479,15 @@ class Memory:
         # the deterministic blend + relevance floor. The pool is generous (see RERANK_FETCH),
         # so the blend - not a cosine pre-filter - is what decides what the agent sees.
         pool_query = _contextual_query(recent or [], query)
-        rows = store.similar_memories(customer_id, embed([pool_query])[0], RERANK_FETCH)
+        try:
+            rows = store.similar_memories(customer_id, embed([pool_query])[0], RERANK_FETCH)
+        except Exception as e:
+            # Fail soft: recall enriches a reply, it is not a hard dependency of one. If the
+            # embedding call or the vector read fails, answer this turn with no recalled
+            # memories rather than 500-ing the chat the customer is waiting on. The miss is
+            # logged; the write path (which has its own guards) still runs.
+            log.warning("recall failed for %s, answering with no memories: %s", customer_id, e)
+            return []
         reranked = contextual_rerank(recent or [], query, rows, k)
         return [
             {"id": r["id"], "text": r["text"], "category": r["category"],

@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS memory_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_memory ON memory_events (memory_id);
+-- customer_id is how the ledger is swept for erasure (delete_customer) and reconstructed
+-- point-in-time (memories_as_of); without this those are seq scans over every event ever.
+CREATE INDEX IF NOT EXISTS idx_events_customer ON memory_events (customer_id, created_at);
 
 CREATE TABLE IF NOT EXISTS sessions (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -55,7 +58,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-
+CREATE INDEX IF NOT EXISTS idx_sessions_customer ON sessions (customer_id);
 
 CREATE TABLE IF NOT EXISTS messages (
     id          BIGSERIAL PRIMARY KEY,
@@ -102,6 +105,12 @@ def close() -> None:
     if _pool is not None:
         _pool.close()
         _pool = None
+
+
+def ping() -> None:
+    """Cheap round-trip that confirms the pool can reach Postgres. Backs /api/ready; raises
+    if the database is unreachable so a readiness probe can fail the instance."""
+    _q("SELECT 1")
 
 
 def init() -> None:
@@ -368,6 +377,30 @@ def memory_history(memory_id: str) -> list[dict]:
            FROM memory_events WHERE memory_id = %s ORDER BY created_at""",
         (memory_id,),
     )
+
+
+def memories_as_of(customer_id: str, when) -> list[dict]:
+    """Reconstruct the memories that were active for a customer AS OF a past instant, purely
+    by replaying the append-only event ledger up to that point - no separate temporal store.
+
+    Each memory's state at time T is decided by its most recent event on or before T: an
+    ADD/UPDATE leaves it active with that event's text, a DELETE/EXPIRE/EVICT leaves it gone.
+    NOOPs are never journalled, so they never appear. `DISTINCT ON (memory_id)` with a
+    descending order keeps exactly that latest-per-memory event; we then keep the ones whose
+    latest event left the memory alive. This is point-in-time recall ("what did Ledger
+    believe about this customer on date X") answered deterministically from the audit trail -
+    the same bitemporal question competitors reach for a graph database to serve.
+    """
+    rows = _q(
+        """SELECT DISTINCT ON (memory_id)
+                  memory_id::text AS id, op, new_text AS text, created_at
+           FROM memory_events
+           WHERE customer_id = %s AND created_at <= %s
+           ORDER BY memory_id, created_at DESC, id DESC""",
+        (customer_id, when),
+    )
+    return [{"id": r["id"], "text": r["text"], "as_of": r["created_at"]}
+            for r in rows if r["op"] in ("ADD", "UPDATE")]
 
 
 # -- sessions & messages -----------------------------------------------------

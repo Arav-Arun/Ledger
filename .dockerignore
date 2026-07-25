@@ -1,0 +1,12 @@
+**/node_modules
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/*.pyc
+.git
+.github
+ui/dist
+.env
+**/.env
+*.md
+Assets

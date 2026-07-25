@@ -4,6 +4,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -58,7 +59,21 @@ class ChatBody(BaseModel):
 
 @app.get("/api/health")
 def health():
+    # Liveness only: the process is up. Cheap and dependency-free, safe for a tight probe.
     return {"ok": True}
+
+
+@app.get("/api/ready")
+def ready():
+    # Readiness: the process can actually serve, i.e. it can reach Postgres. A load balancer
+    # or k8s readiness probe should hit this so a DB outage pulls the instance from rotation
+    # instead of letting it serve 500s. (OpenAI is deliberately not probed here - the read
+    # path fails soft without it, so it is not a readiness gate.)
+    try:
+        store.ping()
+    except Exception as e:
+        raise HTTPException(503, f"database unavailable: {type(e).__name__}")
+    return {"ready": True}
 
 
 @app.get("/api/customers")
@@ -122,7 +137,16 @@ def chat(body: ChatBody):
     learn_reply = reply if grounded else ""
     if not grounded:
         log.warning("reply for %s was not grounded; not learning from it", body.customer_id)
-    events = memory.add(clean, learn_reply, body.customer_id, recent=history[:-1][-6:])
+    try:
+        events = memory.add(clean, learn_reply, body.customer_id, recent=history[:-1][-6:])
+    except Exception as e:
+        # The reply is already produced and persisted; learning is best-effort and must never
+        # fail the turn the customer is waiting on. In production this whole block runs in a
+        # background task (see README - "Demo vs production"); here it is synchronous so the
+        # UI can show this turn's ops, but it is still isolated so an extraction/embedding
+        # outage degrades to "learned nothing this turn" rather than a 500 after the reply.
+        log.exception("learning failed for %s, skipping this turn: %s", body.customer_id, e)
+        events = []
 
     return {"reply": reply, "memories_used": recalled, "events": events,
             "redactions": redactions, "grounding": grounding_trail, "grounded": grounded}
@@ -131,6 +155,17 @@ def chat(body: ChatBody):
 @app.get("/api/memories/{customer_id}")
 def memories(customer_id: str):
     return memory.get_all(customer_id)
+
+
+@app.get("/api/customers/{customer_id}/memories-as-of")
+def memories_as_of(customer_id: str, t: datetime):
+    """Point-in-time recall: the memories that were active for this customer AS OF ISO
+    timestamp `t`, reconstructed purely by replaying the append-only event ledger up to
+    that instant. Because every mutation is journalled in the same transaction that made
+    it, the ledger is a full bitemporal history, not just a change feed - so "what did we
+    believe about this customer on date X" is answered deterministically, with no separate
+    temporal store to keep in sync. See store.memories_as_of."""
+    return store.memories_as_of(customer_id, t)
 
 
 @app.get("/api/memory/{memory_id}/history")

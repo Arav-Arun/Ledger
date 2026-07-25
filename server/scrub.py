@@ -1,6 +1,11 @@
-"""Deterministic PII scrub: strip card numbers, OTP, CVV, PIN, account numbers and
-SSNs before text reaches the LLM or the store. The prompt refuses secrets too; this
-doesn't trust it to.
+"""Deterministic PII scrub: strip card numbers, OTP, CVV, PIN, account numbers, emails,
+phone numbers and SSNs before text reaches the LLM or the store. The prompt refuses
+secrets too; this doesn't trust it to.
+
+Design rule (shared with ACCOUNT_RE below): structureless digit runs are indistinguishable
+from an order/tracking id, so they are only redacted when something disambiguates them - a
+Luhn-valid card shape, a leading keyword, or an unambiguous international `+` phone prefix.
+A bare local 10-digit number is intentionally left alone so real order/tracking ids survive.
 """
 
 import re
@@ -27,6 +32,19 @@ ACCOUNT_RE = re.compile(
 # US Social Security numbers have a fixed, self-identifying shape, so a bare pattern
 # match is safe enough to redact without a leading keyword.
 SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+
+# Emails are self-identifying (the @ and TLD leave no ambiguity), so a bare pattern is safe.
+EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+
+# Phone numbers are structureless digits like account numbers, so we only redact the two
+# unambiguous forms: an international `+<country code>` number, or one introduced by a phone
+# keyword. A bare local number is left alone (see the module docstring) so tracking ids pass.
+PHONE_INTL_RE = re.compile(r"(?<![\w+])\+\d{1,3}[\s-]?\d(?:[\s-]?\d){7,12}\b")
+PHONE_KEYWORD_RE = re.compile(
+    r"\b(phone|mobile|cell|telephone|whatsapp)\b(?:\s*(?:number|no\.?|#|is|at|:|-|=))*\s*"
+    r"(\+?\d(?:[\s-]?\d){7,12})",
+    re.IGNORECASE,
+)
 
 
 def luhn_valid(digits: str) -> bool:
@@ -88,10 +106,27 @@ def scrub(text: str) -> tuple[str, list[str]]:
         found.append("ssn")
         return "[ssn removed]"
 
-    # Run the regex substitutions. Cards first so a Luhn-valid card that also follows an
-    # "account" keyword is caught as a card; then keyword secrets, account numbers, SSNs.
+    def redact_email(m: re.Match) -> str:
+        """Regex replacement callback for email addresses."""
+        found.append("email")
+        return "[email removed]"
+
+    def redact_phone(m: re.Match) -> str:
+        """Regex replacement callback for phone numbers. For the keyword form, redact only
+        the digit run and keep the introducing keyword; for the intl form, redact it all."""
+        found.append("phone number")
+        digits = m.group(m.lastindex) if m.lastindex else m.group()
+        return m.group().replace(digits, "[phone number removed]")
+
+    # Run the substitutions in order. Cards first, so a Luhn-valid card that also follows an
+    # "account" keyword is caught as a card; then keyword secrets, account numbers, SSNs,
+    # emails, and finally phone numbers (after cards, so a 13-19 digit Luhn card is never
+    # mistaken for a long phone number).
     clean = CARD_RE.sub(redact_card, text)
     clean = KEYWORD_RE.sub(redact_keyword, clean)
     clean = ACCOUNT_RE.sub(redact_account, clean)
     clean = SSN_RE.sub(redact_ssn, clean)
+    clean = EMAIL_RE.sub(redact_email, clean)
+    clean = PHONE_KEYWORD_RE.sub(redact_phone, clean)
+    clean = PHONE_INTL_RE.sub(redact_phone, clean)
     return clean, found
